@@ -2,7 +2,7 @@
 
 import numpy as np
 import librosa
-from typing import List, Tuple
+from typing import List, Optional
 from dataclasses import dataclass
 
 
@@ -15,50 +15,67 @@ class ChordDetection:
 
 
 class ChordDetector:
-    """Detect chords from chroma features."""
+    """Detect chords from chroma features using template matching."""
 
     NOTES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
-    # Chord templates (normalized chroma patterns)
-    TEMPLATES = {
-        # Major triads
-        'C': np.array([1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0]),
-        'Cm': np.array([1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0]),
-        'C7': np.array([1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1]),
-        'Cmaj7': np.array([1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1]),
-        'Cm7': np.array([1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]),
-    }
-
     def __init__(self, sr: int = 22050):
         self.sr = sr
-        self._generate_all_templates()
+        self.templates = self._build_templates()
 
-    def _generate_all_templates(self):
-        """Generate templates for all 12 keys."""
-        base_templates = {
-            'maj': np.array([1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0]),
-            'min': np.array([1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0]),
-            '7': np.array([1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1]),
-            'maj7': np.array([1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1]),
-            'min7': np.array([1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]),
+    def _build_templates(self) -> dict:
+        """Build comprehensive chord templates for all keys and types."""
+        templates = {}
+
+        # Base patterns (intervals from root)
+        patterns = {
+            # Triads
+            'maj': [0, 4, 7],      # Major: root, major 3rd, perfect 5th
+            'min': [0, 3, 7],      # Minor: root, minor 3rd, perfect 5th
+            'aug': [0, 4, 8],      # Augmented: root, major 3rd, augmented 5th
+            'dim': [0, 3, 6],      # Diminished: root, minor 3rd, diminished 5th
+
+            # Seventh chords
+            'maj7': [0, 4, 7, 11],      # Major 7
+            'min7': [0, 3, 7, 10],      # Minor 7
+            'dom7': [0, 4, 7, 10],      # Dominant 7
+            'min7b5': [0, 3, 6, 10],    # Half-diminished
+
+            # Sixth chords
+            'maj6': [0, 4, 7, 9],
+            'min6': [0, 3, 7, 9],
+
+            # Sus chords
+            'sus2': [0, 2, 7],
+            'sus4': [0, 5, 7],
         }
 
-        self.templates = {}
+        # Generate templates for each root note
         for root_idx in range(12):
             root_name = self.NOTES[root_idx]
-            for chord_type, pattern in base_templates.items():
-                # Rotate pattern for different roots
-                rotated = np.roll(pattern, root_idx)
-                chord_name = f"{root_name}{chord_type}"
-                self.templates[chord_name] = rotated
 
-    def detect_chords(self, y: np.ndarray, n_fft: int = 2048, hop_length: None = None,
-                      confidence_threshold: float = 0.3) -> List[ChordDetection]:
+            for chord_type, intervals in patterns.items():
+                template = np.zeros(12)
+                for interval in intervals:
+                    chroma_idx = (interval + root_idx) % 12
+                    template[chroma_idx] = 1.0
+
+                chord_name = f"{root_name}{chord_type}"
+                templates[chord_name] = template
+
+        return templates
+
+    def detect_chords(self, y: np.ndarray, n_fft: int = 2048, hop_length: Optional[int] = None,
+                      confidence_threshold: float = 0.3, smooth: bool = True) -> List[ChordDetection]:
         """
-        Detect chords from audio.
+        Detect chords from audio using chroma feature matching.
 
         Args:
-            confidence_threshold: Min correlation score (0-1)
+            y: Audio time series
+            n_fft: FFT window size
+            hop_length: Number of samples per frame
+            confidence_threshold: Minimum correlation score (0-1)
+            smooth: Apply temporal smoothing
 
         Returns:
             List of ChordDetection objects
@@ -66,11 +83,12 @@ class ChordDetector:
         if hop_length is None:
             hop_length = n_fft // 4
 
-        # Extract chroma
+        # Extract chroma features
         chroma = librosa.feature.chroma_cqt(y=y, sr=self.sr, hop_length=hop_length)
+        chroma = librosa.power_to_db(chroma + 1e-8)
 
-        # Normalize chroma frames
-        chroma_norm = chroma / (np.sum(chroma, axis=0, keepdims=True) + 1e-8)
+        # Normalize
+        chroma_norm = (chroma - chroma.min(axis=0, keepdims=True)) / (chroma.max(axis=0, keepdims=True) - chroma.min(axis=0, keepdims=True) + 1e-8)
 
         times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=self.sr, hop_length=hop_length)
 
@@ -78,7 +96,7 @@ class ChordDetector:
         for i in range(chroma.shape[1]):
             frame = chroma_norm[:, i]
 
-            # Correlate with all chord templates
+            # Find best matching chord
             best_chord = None
             best_score = 0
 
@@ -96,34 +114,41 @@ class ChordDetector:
                     confidence=float(best_score * 100)
                 ))
 
+        if smooth:
+            detections = self._smooth_detections(detections)
+
         return detections
 
-    def smooth_detections(self, detections: List[ChordDetection], window_size: int = 3) -> List[ChordDetection]:
+    def _smooth_detections(self, detections: List[ChordDetection], window_time: float = 0.5) -> List[ChordDetection]:
         """
-        Smooth chord detections by merging repeated chords within time window.
+        Smooth chord detections by grouping temporally close identical chords.
 
         Args:
-            window_size: Time window in frames to consider for smoothing
+            window_time: Time window in seconds to consider for grouping
         """
         if not detections:
             return []
 
         smoothed = []
         i = 0
+
         while i < len(detections):
             current = detections[i]
-            same_chord_group = [current]
-
-            # Collect all detections with same chord nearby
+            group = [current]
             j = i + 1
-            while j < len(detections) and detections[j].time - current.time < window_size * 0.02:
-                if detections[j].chord_name == current.chord_name:
-                    same_chord_group.append(detections[j])
-                j += 1
 
-            # Average confidence and time
-            avg_time = np.mean([d.time for d in same_chord_group])
-            avg_conf = np.mean([d.confidence for d in same_chord_group])
+            # Collect same chord within window
+            while j < len(detections):
+                if (detections[j].time - current.time < window_time and
+                    detections[j].chord_name == current.chord_name):
+                    group.append(detections[j])
+                    j += 1
+                else:
+                    break
+
+            # Average group
+            avg_time = np.mean([d.time for d in group])
+            avg_conf = np.mean([d.confidence for d in group])
 
             smoothed.append(ChordDetection(
                 time=avg_time,
@@ -131,6 +156,34 @@ class ChordDetector:
                 confidence=avg_conf
             ))
 
-            i = j if j > i + 1 else i + 1
+            i = j
 
         return smoothed
+
+    def get_key_estimate(self, chords: List[ChordDetection]) -> tuple:
+        """
+        Estimate key from chord sequence (simple heuristic).
+
+        Returns:
+            (key_note, confidence) where key_note is 'C', 'D', etc.
+        """
+        if not chords:
+            return None, 0.0
+
+        # Count root notes in detected chords
+        root_counts = np.zeros(12)
+        for chord in chords:
+            root_note = chord.chord_name[:-1] if len(chord.chord_name) > 1 else chord.chord_name[0]
+            try:
+                idx = self.NOTES.index(root_note)
+                root_counts[idx] += chord.confidence
+            except ValueError:
+                pass
+
+        if root_counts.sum() == 0:
+            return None, 0.0
+
+        best_idx = np.argmax(root_counts)
+        confidence = root_counts[best_idx] / root_counts.sum()
+
+        return self.NOTES[best_idx], float(confidence)

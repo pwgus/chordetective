@@ -2,12 +2,12 @@
 
 import numpy as np
 import librosa
-import librosa.display
 from pathlib import Path
 from typing import List, Optional
 import tempfile
 import os
 import subprocess
+from tqdm import tqdm
 from music_analyzer import Detection
 from chord_detector import ChordDetection
 
@@ -34,41 +34,38 @@ class VideoGenerator:
             resolution: '720p' or '1080p'
             n_fft: FFT window size
         """
-        # Load audio
+        print(f"Loading audio: {audio_path}")
         y, sr = librosa.load(audio_path, sr=self.sr)
         duration = librosa.get_duration(y=y, sr=sr)
 
-        # Compute spectrogram
+        print(f"Computing spectrogram...")
         S, freqs, times = self._compute_spectrogram(y, n_fft)
+        S_db = librosa.power_to_db(S**2, ref=np.max)
 
         # Set resolution
         if resolution == '720p':
             width, height = 1280, 720
-        else:  # 1080p
+        else:
             width, height = 1920, 1080
 
-        # Create temporary directory for frames
+        print(f"Generating {int(duration * self.fps)} frames...")
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Generate frames
             num_frames = int(duration * self.fps)
-            for frame_idx in range(num_frames):
+
+            for frame_idx in tqdm(range(num_frames), desc="Rendering frames"):
                 time_sec = frame_idx / self.fps
-                frame = self._render_frame(S, freqs, times, width, height,
-                                          time_sec, note_detections,
-                                          chord_detections, n_fft)
 
-                frame_path = os.path.join(tmpdir, f'frame_{frame_idx:06d}.png')
-                frame.savefig(frame_path, dpi=100, bbox_inches='tight')
-                import matplotlib.pyplot as plt
-                plt.close(frame)
+                self._render_frame_to_file(
+                    S_db, freqs, times, width, height,
+                    time_sec, note_detections, chord_detections,
+                    os.path.join(tmpdir, f'frame_{frame_idx:06d}.png'),
+                    n_fft
+                )
 
-                if (frame_idx + 1) % 30 == 0:
-                    print(f"Generated {frame_idx + 1}/{num_frames} frames")
-
-            # Combine frames with audio using ffmpeg
+            print("Combining with audio...")
             self._combine_frames_with_audio(tmpdir, audio_path, output_video, width, height)
 
-        print(f"Video saved to {output_video}")
+        print(f"✓ Video saved: {output_video}")
 
     def _compute_spectrogram(self, y: np.ndarray, n_fft: int):
         """Compute STFT spectrogram."""
@@ -79,50 +76,63 @@ class VideoGenerator:
         times = librosa.frames_to_time(np.arange(S.shape[1]), sr=self.sr, hop_length=hop_length)
         return S, freqs, times
 
-    def _render_frame(self, S: np.ndarray, freqs: np.ndarray, times: np.ndarray,
-                     width: int, height: int, current_time: float,
-                     note_detections: List[Detection],
-                     chord_detections: Optional[List[ChordDetection]],
-                     n_fft: int):
-        """Render single frame with spectrogram and overlays."""
+    def _render_frame_to_file(self, S_db: np.ndarray, freqs: np.ndarray, times: np.ndarray,
+                              width: int, height: int, current_time: float,
+                              note_detections: List[Detection],
+                              chord_detections: Optional[List[ChordDetection]],
+                              output_path: str, n_fft: int):
+        """Render frame directly to file."""
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
         from matplotlib.figure import Figure
 
-        fig = Figure(figsize=(width/100, height/100), dpi=100)
+        dpi = 100
+        fig = Figure(figsize=(width/dpi, height/dpi), dpi=dpi)
         ax = fig.add_subplot(111)
 
-        # Draw spectrogram
-        S_db = librosa.power_to_db(S**2, ref=np.max)
+        # Spectrogram
         im = ax.imshow(S_db, aspect='auto', origin='lower',
                       extent=[times[0], times[-1], freqs[0], freqs[-1]],
                       cmap='viridis', interpolation='nearest')
 
-        # Vertical line at current time
-        ax.axvline(current_time, color='white', linewidth=2, alpha=0.7)
+        # Current time cursor
+        ax.axvline(current_time, color='white', linewidth=3, alpha=0.9)
 
-        # Plot notes at current time
-        current_notes = [d for d in note_detections
-                        if abs(d.time - current_time) < 0.1]
-        for det in current_notes:
+        # Nearby notes
+        window = 0.05
+        nearby_notes = [d for d in note_detections
+                       if abs(d.time - current_time) < window]
+        for det in nearby_notes:
             if det.frequency > 0:
-                ax.plot(det.time, det.frequency, 'r*', markersize=15, alpha=0.8)
+                ax.plot(det.time, det.frequency, 'r*', markersize=20, alpha=0.9)
 
-        # Plot chords (text annotation)
+        # Chord annotation
         if chord_detections:
-            current_chords = [d for d in chord_detections
-                            if abs(d.time - current_time) < 0.1]
-            if current_chords:
-                chord_text = ', '.join([f"{d.chord_name} ({d.confidence:.0f}%)"
-                                       for d in current_chords])
-                ax.text(0.02, 0.95, chord_text, transform=ax.transAxes,
-                       fontsize=12, verticalalignment='top',
-                       bbox=dict(boxstyle='round', facecolor='black', alpha=0.7),
+            nearby_chords = [d for d in chord_detections
+                           if abs(d.time - current_time) < window]
+            if nearby_chords:
+                chord_str = ' | '.join([f"{d.chord_name} {d.confidence:.0f}%"
+                                       for d in nearby_chords])
+                ax.text(0.02, 0.98, chord_str, transform=ax.transAxes,
+                       fontsize=14, verticalalignment='top', weight='bold',
+                       bbox=dict(boxstyle='round', facecolor='black', alpha=0.8),
                        color='white')
 
-        ax.set_xlabel('Time (s)')
-        ax.set_ylabel('Frequency (Hz)')
-        ax.set_title(f'Music Analysis - {current_time:.2f}s')
+        # Time indicator
+        min_t = int(current_time) // 60
+        sec_t = int(current_time) % 60
+        ax.text(0.98, 0.02, f"{min_t:02d}:{sec_t:02d}", transform=ax.transAxes,
+               fontsize=12, verticalalignment='bottom', horizontalalignment='right',
+               bbox=dict(boxstyle='round', facecolor='black', alpha=0.7),
+               color='white')
 
-        return fig
+        ax.set_xlabel('Time (s)', fontsize=12)
+        ax.set_ylabel('Frequency (Hz)', fontsize=12)
+        ax.set_title(f'Music Analysis Visualization', fontsize=14, weight='bold')
+
+        fig.savefig(output_path, dpi=dpi, bbox_inches='tight', pad_inches=0)
+        plt.close(fig)
 
     def _combine_frames_with_audio(self, frames_dir: str, audio_path: str,
                                   output_video: str, width: int, height: int):
@@ -130,19 +140,22 @@ class VideoGenerator:
         frame_pattern = os.path.join(frames_dir, 'frame_%06d.png')
 
         cmd = [
-            'ffmpeg',
+            'ffmpeg', '-y',
             '-framerate', str(self.fps),
             '-i', frame_pattern,
             '-i', audio_path,
             '-c:v', 'libx264',
-            '-preset', 'slow',
-            '-crf', '18',
+            '-preset', 'medium',
+            '-crf', '20',
             '-c:a', 'aac',
+            '-b:a', '128k',
             '-shortest',
             output_video
         ]
 
         try:
-            subprocess.run(cmd, check=True, capture_output=True)
-        except Exception as e:
-            raise RuntimeError(f"FFmpeg error: {e}")
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"FFmpeg error: {e.stderr}")
+        except FileNotFoundError:
+            raise RuntimeError("FFmpeg not found. Install it: brew install ffmpeg (macOS) or sudo apt install ffmpeg (Linux)")

@@ -12,6 +12,19 @@ from music_analyzer import Detection
 from chord_detector import ChordDetection
 
 
+def _active_at(detections, current_time: float, fallback_window: float = 0.05):
+    """Detections whose span covers `current_time` (legacy ones use a window)."""
+    active = []
+    for d in detections:
+        duration = getattr(d, 'duration', 0.0)
+        if duration > 0:
+            if d.time <= current_time < d.time + duration:
+                active.append(d)
+        elif abs(d.time - current_time) < fallback_window:
+            active.append(d)
+    return active
+
+
 class VideoGenerator:
     """Generate MP4 video with spectrogram and analysis overlay."""
 
@@ -22,24 +35,35 @@ class VideoGenerator:
     def generate_from_analysis(self, audio_path: str, output_video: str,
                               note_detections: List[Detection],
                               chord_detections: Optional[List[ChordDetection]] = None,
-                              resolution: str = '720p', n_fft: int = 2048):
+                              raw_note_detections: Optional[List[Detection]] = None,
+                              onset_times: Optional[List[float]] = None,
+                              resolution: str = '720p', n_fft: int = 2048,
+                              transform: str = 'cqt'):
         """
         Generate video with audio, spectrogram, and detections overlay.
+
+        On-screen annotations always use the smoothed sequences
+        (`note_detections` / `chord_detections`). Pass `raw_note_detections`
+        to additionally draw the unsmoothed detections in a faint color, and
+        `onset_times` to mark detected onsets on the timeline.
 
         Args:
             audio_path: Input audio file
             output_video: Output MP4 path
-            note_detections: List of note detections
-            chord_detections: List of chord detections (optional)
+            note_detections: Smoothed note sequence
+            chord_detections: Smoothed chord sequence (optional)
+            raw_note_detections: Raw note detections (optional, faint overlay)
+            onset_times: Detected onset times in seconds (optional)
             resolution: '720p' or '1080p'
-            n_fft: FFT window size
+            n_fft: FFT window size (STFT) / hop source (CQT)
+            transform: 'cqt' or 'stft' background spectrogram
         """
         print(f"Loading audio: {audio_path}")
         y, sr = librosa.load(audio_path, sr=self.sr)
         duration = librosa.get_duration(y=y, sr=sr)
 
-        print(f"Computing spectrogram...")
-        S, freqs, times = self._compute_spectrogram(y, n_fft)
+        print(f"Computing spectrogram ({transform})...")
+        S, freqs, times = self._compute_spectrogram(y, n_fft, transform)
         S_db = librosa.power_to_db(S**2, ref=np.max)
 
         # Set resolution
@@ -58,8 +82,9 @@ class VideoGenerator:
                 self._render_frame_to_file(
                     S_db, freqs, times, width, height,
                     time_sec, note_detections, chord_detections,
+                    raw_note_detections, onset_times,
                     os.path.join(tmpdir, f'frame_{frame_idx:06d}.png'),
-                    n_fft
+                    transform
                 )
 
             print("Combining with audio...")
@@ -67,12 +92,24 @@ class VideoGenerator:
 
         print(f"✓ Video saved: {output_video}")
 
-    def _compute_spectrogram(self, y: np.ndarray, n_fft: int):
-        """Compute STFT spectrogram."""
+    def _compute_spectrogram(self, y: np.ndarray, n_fft: int, transform: str = 'cqt'):
+        """Compute spectrogram via STFT or CQT."""
         hop_length = n_fft // 4
-        D = librosa.stft(y, n_fft=n_fft, hop_length=hop_length)
-        S = np.abs(D)
-        freqs = librosa.fft_frequencies(sr=self.sr, n_fft=n_fft)
+        if transform == 'stft':
+            D = librosa.stft(y, n_fft=n_fft, hop_length=hop_length)
+            S = np.abs(D)
+            freqs = librosa.fft_frequencies(sr=self.sr, n_fft=n_fft)
+        else:
+            n_bins, bins_per_octave = 84, 12
+            fmin = librosa.note_to_hz('C1')
+            # librosa.cqt requires hop_length divisible by 2**(n_octaves - 1)
+            required = 2 ** (int(np.ceil(n_bins / bins_per_octave)) - 1)
+            hop_length = max(required, (hop_length // required) * required)
+            S = np.abs(librosa.cqt(y, sr=self.sr, hop_length=hop_length,
+                                   fmin=fmin, n_bins=n_bins,
+                                   bins_per_octave=bins_per_octave))
+            freqs = librosa.cqt_frequencies(n_bins=n_bins, fmin=fmin,
+                                            bins_per_octave=bins_per_octave)
         times = librosa.frames_to_time(np.arange(S.shape[1]), sr=self.sr, hop_length=hop_length)
         return S, freqs, times
 
@@ -80,40 +117,72 @@ class VideoGenerator:
                               width: int, height: int, current_time: float,
                               note_detections: List[Detection],
                               chord_detections: Optional[List[ChordDetection]],
-                              output_path: str, n_fft: int):
+                              raw_note_detections: Optional[List[Detection]],
+                              onset_times: Optional[List[float]],
+                              output_path: str, transform: str):
         """Render frame directly to file."""
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
+        import matplotlib.transforms as mtransforms
         from matplotlib.figure import Figure
 
         dpi = 100
         fig = Figure(figsize=(width/dpi, height/dpi), dpi=dpi)
         ax = fig.add_subplot(111)
 
-        # Spectrogram
-        im = ax.imshow(S_db, aspect='auto', origin='lower',
+        # Spectrogram (log frequency axis for CQT)
+        if transform == 'cqt':
+            ax.pcolormesh(times, freqs, S_db, cmap='viridis', shading='auto')
+            ax.set_yscale('log')
+            ax.set_ylim(freqs[0], freqs[-1])
+        else:
+            ax.imshow(S_db, aspect='auto', origin='lower',
                       extent=[times[0], times[-1], freqs[0], freqs[-1]],
                       cmap='viridis', interpolation='nearest')
+
+        # Onset markers on the timeline (small ticks at the bottom)
+        if onset_times is not None and len(onset_times) > 0:
+            trans = mtransforms.blended_transform_factory(ax.transData, ax.transAxes)
+            ax.vlines(onset_times, 0.0, 0.035, transform=trans,
+                      color='cyan', linewidth=1, alpha=0.8)
+
+        # Raw (unsmoothed) detections in a faint color
+        if raw_note_detections:
+            raw_pts = [(d.time, d.frequency) for d in raw_note_detections if d.frequency > 0]
+            if raw_pts:
+                rx, ry = zip(*raw_pts)
+                ax.scatter(rx, ry, s=10, color='lightgray', alpha=0.35, zorder=3)
+
+        # Smoothed note spans
+        for det in note_detections:
+            if det.frequency > 0 and det.duration > 0:
+                ax.hlines(det.frequency, det.time, det.time + det.duration,
+                          colors='orange', linewidth=3, alpha=0.85, zorder=4)
 
         # Current time cursor
         ax.axvline(current_time, color='white', linewidth=3, alpha=0.9)
 
-        # Nearby notes
-        window = 0.05
-        nearby_notes = [d for d in note_detections
-                       if abs(d.time - current_time) < window]
-        for det in nearby_notes:
+        # Active smoothed notes
+        active_notes = [d for d in _active_at(note_detections, current_time)
+                        if d.note_name != 'silence']
+        for det in active_notes:
             if det.frequency > 0:
-                ax.plot(det.time, det.frequency, 'r*', markersize=20, alpha=0.9)
+                ax.plot(current_time, det.frequency, 'r*', markersize=20,
+                        alpha=0.9, zorder=5)
+        if active_notes:
+            note_str = ' | '.join(f"♪ {d.note_name}" for d in active_notes)
+            ax.text(0.02, 0.90, note_str, transform=ax.transAxes,
+                    fontsize=13, verticalalignment='top', weight='bold',
+                    bbox=dict(boxstyle='round', facecolor='black', alpha=0.8),
+                    color='orange')
 
-        # Chord annotation
+        # Active smoothed chord annotation
         if chord_detections:
-            nearby_chords = [d for d in chord_detections
-                           if abs(d.time - current_time) < window]
-            if nearby_chords:
+            active_chords = _active_at(chord_detections, current_time)
+            if active_chords:
                 chord_str = ' | '.join([f"{d.chord_name} {d.confidence:.0f}%"
-                                       for d in nearby_chords])
+                                       for d in active_chords])
                 ax.text(0.02, 0.98, chord_str, transform=ax.transAxes,
                        fontsize=14, verticalalignment='top', weight='bold',
                        bbox=dict(boxstyle='round', facecolor='black', alpha=0.8),

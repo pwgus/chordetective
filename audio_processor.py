@@ -4,7 +4,7 @@ import numpy as np
 import librosa
 import librosa.display
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import List, Tuple, Optional
 
 
 class AudioProcessor:
@@ -58,6 +58,152 @@ class AudioProcessor:
         times = librosa.frames_to_time(np.arange(S.shape[1]), sr=self.sr, hop_length=hop_length)
 
         return S, freqs, times
+
+    def compute_cqt(self, hop_length: int = 512, n_bins: int = 84,
+                    bins_per_octave: int = 12, fmin: Optional[float] = None
+                    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Compute Constant-Q Transform magnitude.
+
+        CQT uses geometrically spaced frequency bins (one per semitone by
+        default), so resolution adapts per frequency — better suited to
+        tonal music than the fixed-resolution STFT.
+
+        Returns:
+            (C, freqs, times) where C is magnitude [n_bins × time]
+        """
+        if self.y is None:
+            raise RuntimeError("No audio loaded. Call load() first.")
+
+        if fmin is None:
+            fmin = librosa.note_to_hz('C1')
+
+        # librosa.cqt requires hop_length divisible by 2**(n_octaves - 1)
+        n_octaves = int(np.ceil(n_bins / bins_per_octave))
+        required = 2 ** (n_octaves - 1)
+        hop_length = max(required, (hop_length // required) * required)
+
+        C = np.abs(librosa.cqt(self.y, sr=self.sr, hop_length=hop_length,
+                               fmin=fmin, n_bins=n_bins,
+                               bins_per_octave=bins_per_octave))
+        freqs = librosa.cqt_frequencies(n_bins=n_bins, fmin=fmin,
+                                        bins_per_octave=bins_per_octave)
+        times = librosa.frames_to_time(np.arange(C.shape[1]), sr=self.sr,
+                                       hop_length=hop_length)
+        return C, freqs, times
+
+    def compute_transform(self, transform: str = 'cqt', n_fft: int = 2048,
+                          hop_length: Optional[int] = None
+                          ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Compute magnitude spectrum with selected method ('cqt' or 'stft')."""
+        if transform == 'stft':
+            return self.compute_spectrogram(n_fft=n_fft, hop_length=hop_length)
+        if hop_length is None:
+            hop_length = n_fft // 4
+        return self.compute_cqt(hop_length=hop_length)
+
+    def detect_onsets(self, hop_length: int = 512, backtrack: bool = True) -> np.ndarray:
+        """Detect note onset times (seconds) via onset strength peak picking."""
+        if self.y is None:
+            raise RuntimeError("No audio loaded.")
+        return librosa.onset.onset_detect(
+            y=self.y, sr=self.sr, hop_length=hop_length,
+            backtrack=backtrack, units='time'
+        )
+
+    def compute_spectral_flux(self, hop_length: int = 512) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Spectral flux envelope (frame-to-frame spectral change).
+
+        Returns:
+            (flux, times) — high values mark transitions, low values stability
+        """
+        if self.y is None:
+            raise RuntimeError("No audio loaded.")
+        flux = librosa.onset.onset_strength(y=self.y, sr=self.sr, hop_length=hop_length)
+        times = librosa.frames_to_time(np.arange(len(flux)), sr=self.sr,
+                                       hop_length=hop_length)
+        return flux, times
+
+    def segment_by_onsets(self, hop_length: int = 512,
+                          min_segment: float = 0.05) -> List[Tuple[float, float]]:
+        """Split audio at detected onsets: each segment is one musical event."""
+        onsets = self.detect_onsets(hop_length=hop_length)
+        return self._boundaries_to_segments(onsets, min_segment)
+
+    def segment_fixed(self, window_size: int = 2048) -> List[Tuple[float, float]]:
+        """Split audio into fixed windows of `window_size` samples."""
+        if self.y is None:
+            raise RuntimeError("No audio loaded.")
+        win_t = max(window_size, 256) / self.sr
+        segments = []
+        t = 0.0
+        while t < self.duration:
+            end = min(t + win_t, self.duration)
+            segments.append((t, end))
+            t = end
+        # Merge a tiny trailing remainder into the previous window
+        if len(segments) > 1 and (segments[-1][1] - segments[-1][0]) < win_t * 0.5:
+            last = segments.pop()
+            segments[-1] = (segments[-1][0], last[1])
+        return segments
+
+    def segment_adaptive(self, sensitivity: float = 0.5, hop_length: int = 512,
+                         min_segment: float = 0.05,
+                         max_segment: float = 1.0) -> List[Tuple[float, float]]:
+        """
+        Flux-driven adaptive segmentation.
+
+        Boundaries are placed at spectral-flux peaks above a threshold derived
+        from `sensitivity` (0.0–1.0): low flux yields long windows (capped at
+        `max_segment`), high flux yields short ones. Higher sensitivity means
+        more boundaries / smaller windows.
+        """
+        if self.y is None:
+            raise RuntimeError("No audio loaded.")
+
+        flux, times = self.compute_spectral_flux(hop_length=hop_length)
+        if flux.size == 0 or flux.max() <= 0:
+            return [(0.0, self.duration)]
+
+        norm = flux / flux.max()
+        sensitivity = float(np.clip(sensitivity, 0.0, 1.0))
+        threshold = 1.0 - 0.95 * sensitivity
+
+        rising = np.r_[True, norm[1:] >= norm[:-1]]
+        falling = np.r_[norm[:-1] > norm[1:], True]
+        boundaries = times[(norm >= threshold) & rising & falling]
+
+        segments = self._boundaries_to_segments(boundaries, min_segment)
+
+        # Split overly long stable stretches so the window keeps adapting
+        out = []
+        for t0, t1 in segments:
+            n = int(np.ceil((t1 - t0) / max_segment))
+            if n <= 1:
+                out.append((t0, t1))
+            else:
+                step = (t1 - t0) / n
+                out.extend((t0 + i * step, t0 + (i + 1) * step) for i in range(n))
+        return out
+
+    def _boundaries_to_segments(self, boundary_times, min_segment: float
+                                ) -> List[Tuple[float, float]]:
+        """Convert boundary times into contiguous segments covering the audio."""
+        dur = self.duration
+        bounds = sorted({0.0, dur} | {float(t) for t in boundary_times if 0.0 < t < dur})
+
+        segments = []
+        start = bounds[0]
+        for b in bounds[1:]:
+            if b - start >= min_segment:
+                segments.append((start, b))
+                start = b
+        if not segments:
+            return [(0.0, dur)]
+        if segments[-1][1] < dur:
+            segments[-1] = (segments[-1][0], dur)
+        return segments
 
     def get_audio_chunk(self, start_time: float, duration: float) -> np.ndarray:
         """Extract audio chunk from [start_time, start_time + duration] in seconds."""

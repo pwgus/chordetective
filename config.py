@@ -20,6 +20,19 @@ class Config:
         'use_cache': True,
         'video_fps': 30,
         'video_resolution': '720p',
+        # Analysis transform and segmentation
+        'transform': 'cqt',               # 'cqt' | 'stft'
+        'segmentation': 'onsets',         # 'onsets' | 'fixed' | 'adaptive'
+        'window_size': 2048,              # samples; fixed mode only
+        'flux_sensitivity': 0.5,          # 0.0-1.0; adaptive mode only
+        'note_method': 'pitch',           # 'pitch' | 'chroma'
+        # Post-analysis smoothing
+        'min_note_duration_ms': 100,      # 0 disables
+        'median_frames': 3,               # 1 disables (range 1-15)
+        'majority_frames': 0,             # 0 disables; gaussian-weighted vote
+        'hmm_smoothing': False,           # Viterbi smoothing (slow)
+        # Visualization
+        'show_raw_comparison': True,      # overlay raw detections in gray
     }
 
     def __init__(self, config_file: str = '.music_analyzer.json'):

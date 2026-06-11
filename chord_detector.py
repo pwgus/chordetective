@@ -12,6 +12,7 @@ class ChordDetection:
     time: float
     chord_name: str
     confidence: float  # 0-100
+    duration: float = 0.0  # seconds; 0 for legacy frame-wise detections
 
 
 class ChordDetector:
@@ -65,8 +66,17 @@ class ChordDetector:
 
         return templates
 
+    def _compute_chroma(self, y: np.ndarray, n_fft: int, hop_length: int,
+                        transform: str = 'cqt') -> np.ndarray:
+        """Chroma features via CQT (default) or STFT."""
+        if transform == 'stft':
+            return librosa.feature.chroma_stft(y=y, sr=self.sr, n_fft=n_fft,
+                                               hop_length=hop_length)
+        return librosa.feature.chroma_cqt(y=y, sr=self.sr, hop_length=hop_length)
+
     def detect_chords(self, y: np.ndarray, n_fft: int = 2048, hop_length: Optional[int] = None,
-                      confidence_threshold: float = 0.3, smooth: bool = True) -> List[ChordDetection]:
+                      confidence_threshold: float = 0.3, smooth: bool = True,
+                      transform: str = 'cqt') -> List[ChordDetection]:
         """
         Detect chords from audio using chroma feature matching.
 
@@ -76,6 +86,7 @@ class ChordDetector:
             hop_length: Number of samples per frame
             confidence_threshold: Minimum correlation score (0-1)
             smooth: Apply temporal smoothing
+            transform: 'cqt' (default) or 'stft' chroma source
 
         Returns:
             List of ChordDetection objects
@@ -84,7 +95,7 @@ class ChordDetector:
             hop_length = n_fft // 4
 
         # Extract chroma features
-        chroma = librosa.feature.chroma_cqt(y=y, sr=self.sr, hop_length=hop_length)
+        chroma = self._compute_chroma(y, n_fft, hop_length, transform)
         chroma = librosa.power_to_db(chroma + 1e-8)
 
         # Normalize
@@ -116,6 +127,66 @@ class ChordDetector:
 
         if smooth:
             detections = self._smooth_detections(detections)
+
+        return detections
+
+    def detect_chords_segmented(self, y: np.ndarray, segments,
+                                transform: str = 'cqt', n_fft: int = 2048,
+                                hop_length: Optional[int] = None,
+                                confidence_threshold: float = 0.3) -> List[ChordDetection]:
+        """
+        Detect one chord per segment by matching the segment's mean chroma.
+
+        Quiet segments and matches below the threshold become 'N.C.'
+        (no chord), keeping the output timeline contiguous.
+
+        Args:
+            segments: list of (start_s, end_s) from AudioProcessor segmentation
+            transform: 'cqt' (default) or 'stft' chroma source
+        """
+        if not segments:
+            return []
+        if hop_length is None:
+            hop_length = n_fft // 4
+
+        from music_analyzer import (_segment_frames, _segment_rms,
+                                    SILENCE_RMS_RATIO)
+
+        chroma = self._compute_chroma(y, n_fft, hop_length, transform)
+        times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=self.sr,
+                                       hop_length=hop_length)
+
+        seg_rms = [_segment_rms(y, t0, t1, self.sr) for t0, t1 in segments]
+        peak_rms = max(seg_rms) if seg_rms else 0.0
+
+        detections = []
+        for (t0, t1), rms in zip(segments, seg_rms):
+            if peak_rms <= 0 or rms < SILENCE_RMS_RATIO * peak_rms:
+                detections.append(ChordDetection(
+                    time=float(t0), chord_name='N.C.', confidence=90.0,
+                    duration=float(t1 - t0)))
+                continue
+
+            i0, i1 = _segment_frames(times, t0, t1)
+            vec = chroma[:, i0:i1].mean(axis=1)
+            vec = vec / (vec.max() + 1e-8)
+
+            best_chord, best_score = None, 0.0
+            for chord_name, template in self.templates.items():
+                score = np.dot(vec, template) / (
+                    np.linalg.norm(vec) * np.linalg.norm(template) + 1e-8)
+                if score > best_score:
+                    best_score = score
+                    best_chord = chord_name
+
+            if best_score >= confidence_threshold:
+                name, conf = best_chord, best_score
+            else:
+                # Confidence reflects certainty that no chord matches
+                name, conf = 'N.C.', 1.0 - best_score
+            detections.append(ChordDetection(
+                time=float(t0), chord_name=name,
+                confidence=float(conf * 100), duration=float(t1 - t0)))
 
         return detections
 

@@ -1,21 +1,39 @@
 """Advanced CLI with full feature support."""
 
 import argparse
+import dataclasses
 import sys
 from pathlib import Path
+
 from audio_processor import AudioProcessor
-from music_analyzer import NoteDetector
+from music_analyzer import AnalysisSettings, AnalysisResult, run_full_analysis
 from chord_detector import ChordDetector
 from video_generator import VideoGenerator
 from exporters import AnalysisExporter
 from cache_manager import CacheManager
 from config import Config
 
+# Maps CLI argument names to user-config keys (persisted between runs)
+CONFIG_ARG_MAP = {
+    'n_fft': 'n_fft',
+    'note_conf': 'note_confidence_threshold',
+    'chord_conf': 'chord_confidence_threshold',
+    'segmentation': 'segmentation',
+    'window_size': 'window_size',
+    'flux_sensitivity': 'flux_sensitivity',
+    'min_note_duration': 'min_note_duration_ms',
+    'median_frames': 'median_frames',
+    'majority_frames': 'majority_frames',
+    'hmm': 'hmm_smoothing',
+    'transform': 'transform',
+    'video_res': 'video_resolution',
+}
 
-def analyze_and_export(audio_path: str, output_dir: str = None, n_fft: int = 2048,
-                      note_conf: float = 0.4, chord_conf: float = 0.3,
-                      generate_video: bool = False, video_res: str = '720p',
-                      use_cache: bool = True):
+
+def analyze_and_export(audio_path: str, settings: AnalysisSettings,
+                       output_dir: str = None, generate_video: bool = False,
+                       video_res: str = '720p', use_cache: bool = True,
+                       show_raw: bool = False):
     """Full analysis pipeline with export and optional video generation."""
 
     audio_path = Path(audio_path)
@@ -26,28 +44,40 @@ def analyze_and_export(audio_path: str, output_dir: str = None, n_fft: int = 204
     output_dir = Path(output_dir or audio_path.parent / "analysis")
     output_dir.mkdir(exist_ok=True)
 
-    # Cache check
+    # Cache check (key includes every analysis-relevant parameter)
     cache = CacheManager()
-    if use_cache:
-        cached = cache.load_analysis(str(audio_path), n_fft, 'combined')
-        if cached:
-            print("✓ Loaded from cache")
-            notes = cached.get('notes', [])
-            chords = cached.get('chords', [])
-            processor = cached.get('processor_data')
-            duration = cached.get('duration')
-        else:
-            print("○ Cache miss, analyzing...")
-            processor, notes, chords, duration = _analyze(audio_path, n_fft, note_conf, chord_conf)
-            cache.save_analysis(str(audio_path), n_fft, 'combined',
-                              {'notes': notes, 'chords': chords, 'duration': duration})
-    else:
-        processor, notes, chords, duration = _analyze(audio_path, n_fft, note_conf, chord_conf)
+    cache_token = settings.cache_token()
+    result = None
+    duration = None
 
-    # Export results
+    if use_cache:
+        cached = cache.load_analysis(str(audio_path), settings.n_fft, cache_token)
+        if cached and isinstance(cached.get('result'), AnalysisResult):
+            print("✓ Loaded from cache")
+            result = cached['result']
+            duration = cached['duration']
+
+    if result is None:
+        if use_cache:
+            print("○ Cache miss, analyzing...")
+        result, duration = _analyze(audio_path, settings)
+        if use_cache:
+            cache.save_analysis(str(audio_path), settings.n_fft, cache_token,
+                                {'result': result, 'duration': duration})
+
+    notes, chords = result.notes, result.chords
+
+    # Export results (smoothed sequences)
     print("Exporting results...")
+    metadata = {
+        'settings': settings.to_dict(),
+        'onsets': result.onset_times,
+        'raw_note_count': len(result.raw_notes),
+        'raw_chord_count': len(result.raw_chords),
+    }
     json_out = output_dir / f"{audio_path.stem}_analysis.json"
-    AnalysisExporter.export_json(str(json_out), str(audio_path), duration, notes, chords)
+    AnalysisExporter.export_json(str(json_out), str(audio_path), duration,
+                                 notes, chords, metadata)
     print(f"  ✓ JSON: {json_out}")
 
     csv_notes = output_dir / f"{audio_path.stem}_notes.csv"
@@ -63,13 +93,16 @@ def analyze_and_export(audio_path: str, output_dir: str = None, n_fft: int = 204
     print(f"  ✓ Combined CSV: {csv_combined}")
 
     # Print summary
+    audible = [n for n in notes if n.note_name != 'silence']
+    real_chords = [c for c in chords if c.chord_name != 'N.C.']
     print(f"\n📊 Results:")
     print(f"  Duration: {duration:.1f}s")
-    print(f"  Notes detected: {len(notes)}")
-    print(f"  Chords detected: {len(chords)}")
-    if chords:
+    print(f"  Notes: {len(result.raw_notes)} raw segments -> {len(audible)} smoothed notes")
+    print(f"  Chords: {len(result.raw_chords)} raw segments -> {len(real_chords)} smoothed chords")
+    print(f"  Onsets detected: {len(result.onset_times)}")
+    if real_chords:
         chord_detector = ChordDetector()
-        key, key_conf = chord_detector.get_key_estimate(chords)
+        key, key_conf = chord_detector.get_key_estimate(real_chords)
         if key:
             print(f"  Estimated key: {key} ({key_conf*100:.0f}%)")
 
@@ -81,7 +114,11 @@ def analyze_and_export(audio_path: str, output_dir: str = None, n_fft: int = 204
             generator = VideoGenerator(fps=30)
             generator.generate_from_analysis(
                 str(audio_path), str(video_out),
-                notes, chords, resolution=video_res, n_fft=n_fft
+                notes, chords,
+                raw_note_detections=result.raw_notes if show_raw else None,
+                onset_times=result.onset_times,
+                resolution=video_res, n_fft=settings.n_fft,
+                transform=settings.transform
             )
             print(f"  ✓ Video: {video_out}")
         except RuntimeError as e:
@@ -90,64 +127,87 @@ def analyze_and_export(audio_path: str, output_dir: str = None, n_fft: int = 204
     print(f"\n✓ All results saved to: {output_dir}")
 
 
-def _analyze(audio_path: Path, n_fft: int, note_conf: float, chord_conf: float):
-    """Perform analysis, return (processor, notes, chords, duration)."""
+def _analyze(audio_path: Path, settings: AnalysisSettings):
+    """Perform analysis, return (result, duration)."""
     processor = AudioProcessor()
     processor.load(str(audio_path))
 
-    print(f"Detecting notes...")
-    note_detector = NoteDetector(sr=processor.sr)
-    notes = note_detector.detect_notes_from_pitch(
-        processor.y, n_fft=n_fft, confidence_threshold=note_conf
-    )
-    print(f"  Found {len(notes)} notes")
+    print(f"Analyzing (transform={settings.transform}, "
+          f"segmentation={settings.segmentation})...")
+    result = run_full_analysis(processor, settings)
+    print(f"  {len(result.segments)} segments, "
+          f"{len(result.notes)} note events, {len(result.chords)} chord events")
 
-    print(f"Detecting chords...")
-    chord_detector = ChordDetector(sr=processor.sr)
-    chords = chord_detector.detect_chords(
-        processor.y, n_fft=n_fft, confidence_threshold=chord_conf, smooth=True
-    )
-    print(f"  Found {len(chords)} chords")
-
-    duration = processor.get_duration()
-    return processor, notes, chords, duration
+    return result, processor.get_duration()
 
 
 def main():
+    config = Config()
+
     parser = argparse.ArgumentParser(
         description='Music Analyzer - Full analysis pipeline',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''Examples:
-  # Basic analysis
+  # Basic analysis (onset segmentation + CQT + smoothing defaults)
   python cli_advanced.py song.wav
 
-  # High quality with video
-  python cli_advanced.py song.wav --video --video-res 1080p
+  # High quality with video showing raw vs smoothed detections
+  python cli_advanced.py song.wav --video --video-res 1080p --show-raw
 
-  # Batch processing
-  python cli_advanced.py *.wav --output-dir ./results
+  # Fixed windows like the old behaviour, no smoothing
+  python cli_advanced.py song.wav --segmentation fixed --window-size 2048 \\
+      --median-frames 1 --min-note-duration 0
 
-  # High sensitivity
-  python cli_advanced.py song.wav --note-conf 0.3 --chord-conf 0.2
+  # Adaptive windows, aggressive smoothing with HMM
+  python cli_advanced.py song.wav --segmentation adaptive \\
+      --flux-sensitivity 0.7 --hmm
         '''
     )
 
     parser.add_argument('files', nargs='+', help='Audio file(s) to analyze')
     parser.add_argument('--output-dir', help='Output directory (default: same as input)')
-    parser.add_argument('--n-fft', type=int, default=2048,
-                       help='FFT window size (default: 2048)')
-    parser.add_argument('--note-conf', type=float, default=0.4,
-                       help='Note confidence threshold 0-1 (default: 0.4)')
-    parser.add_argument('--chord-conf', type=float, default=0.3,
-                       help='Chord confidence threshold 0-1 (default: 0.3)')
+    parser.add_argument('--n-fft', type=int, default=None,
+                        help='FFT window size (default: 2048)')
+    parser.add_argument('--note-conf', type=float, default=None,
+                        help='Note confidence threshold 0-1 (default: 0.4)')
+    parser.add_argument('--chord-conf', type=float, default=None,
+                        help='Chord confidence threshold 0-1 (default: 0.3)')
+    parser.add_argument('--segmentation', choices=['onsets', 'fixed', 'adaptive'],
+                        default=None,
+                        help='Segmentation mode (default: onsets)')
+    parser.add_argument('--window-size', type=int, default=None,
+                        help='Window size in samples, fixed mode only (default: 2048)')
+    parser.add_argument('--flux-sensitivity', type=float, default=None,
+                        help='Transition sensitivity 0.0-1.0, adaptive mode only (default: 0.5)')
+    parser.add_argument('--min-note-duration', type=int, default=None,
+                        help='Discard notes shorter than this many ms (default: 100)')
+    parser.add_argument('--median-frames', type=int, default=None,
+                        help='Median filter size in frames, 1-15, 1 disables (default: 3)')
+    parser.add_argument('--majority-frames', type=int, default=None,
+                        help='Gaussian-weighted majority vote window, 0 disables (default: 0)')
+    parser.add_argument('--hmm', action=argparse.BooleanOptionalAction, default=None,
+                        help='HMM (Viterbi) smoothing; slower (default: off)')
+    parser.add_argument('--transform', choices=['cqt', 'stft'], default=None,
+                        help='Analysis transform (default: cqt)')
     parser.add_argument('--video', action='store_true',
-                       help='Generate MP4 video with visualization')
-    parser.add_argument('--video-res', choices=['720p', '1080p'], default='720p',
-                       help='Video resolution (default: 720p)')
+                        help='Generate MP4 video with visualization')
+    parser.add_argument('--video-res', choices=['720p', '1080p'], default=None,
+                        help='Video resolution (default: 720p)')
+    parser.add_argument('--show-raw', action='store_true',
+                        help='Also draw raw (unsmoothed) detections in the video')
     parser.add_argument('--no-cache', action='store_true',
-                       help='Disable caching')
+                        help='Disable caching')
 
     args = parser.parse_args()
+
+    # Persist explicitly given parameters; unset ones fall back to saved config
+    for arg_name, cfg_key in CONFIG_ARG_MAP.items():
+        value = getattr(args, arg_name)
+        if value is not None:
+            config.set(cfg_key, value)
+
+    settings = AnalysisSettings.from_config(config.to_dict())
+    video_res = config.get('video_resolution', '720p')
 
     # Expand wildcards
     import glob
@@ -173,13 +233,12 @@ def main():
         try:
             analyze_and_export(
                 filepath,
+                settings,
                 output_dir=args.output_dir,
-                n_fft=args.n_fft,
-                note_conf=args.note_conf,
-                chord_conf=args.chord_conf,
                 generate_video=args.video,
-                video_res=args.video_res,
-                use_cache=not args.no_cache
+                video_res=video_res,
+                use_cache=not args.no_cache,
+                show_raw=args.show_raw
             )
         except Exception as e:
             print(f"✗ Error: {e}", file=sys.stderr)

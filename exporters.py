@@ -23,6 +23,7 @@ class AnalysisExporter:
             'notes': [
                 {
                     'time': n.time,
+                    'duration': getattr(n, 'duration', 0.0),
                     'name': n.note_name,
                     'frequency': n.frequency,
                     'confidence': n.confidence
@@ -35,6 +36,7 @@ class AnalysisExporter:
             data['chords'] = [
                 {
                     'time': c.time,
+                    'duration': getattr(c, 'duration', 0.0),
                     'name': c.chord_name,
                     'confidence': c.confidence
                 }
@@ -49,10 +51,11 @@ class AnalysisExporter:
         """Export notes to CSV."""
         with open(output_path, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['Time (s)', 'Note', 'Frequency (Hz)', 'Confidence (%)'])
+            writer.writerow(['Time (s)', 'Duration (s)', 'Note', 'Frequency (Hz)', 'Confidence (%)'])
             for note in notes:
                 writer.writerow([
                     f'{note.time:.3f}',
+                    f'{getattr(note, "duration", 0.0):.3f}',
                     note.note_name,
                     f'{note.frequency:.1f}',
                     f'{note.confidence:.1f}'
@@ -63,10 +66,11 @@ class AnalysisExporter:
         """Export chords to CSV."""
         with open(output_path, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['Time (s)', 'Chord', 'Confidence (%)'])
+            writer.writerow(['Time (s)', 'Duration (s)', 'Chord', 'Confidence (%)'])
             for chord in chords:
                 writer.writerow([
                     f'{chord.time:.3f}',
+                    f'{getattr(chord, "duration", 0.0):.3f}',
                     chord.chord_name,
                     f'{chord.confidence:.1f}'
                 ])

@@ -84,6 +84,8 @@ Examples:
     batch_parser.add_argument('--show-raw', action='store_true',
                               help='Draw raw detections in the video too')
     batch_parser.add_argument('--no-cache', action='store_true')
+    batch_parser.add_argument('-j', '--jobs', type=int, default=None,
+                              help='Parallel worker processes (default: auto)')
     _add_analysis_flags(batch_parser)
 
     args = parser.parse_args()
@@ -118,6 +120,8 @@ Examples:
             argv.append('--show-raw')
         if args.no_cache:
             argv.append('--no-cache')
+        if args.jobs is not None:
+            argv.extend(['--jobs', str(args.jobs)])
         _forward_analysis_flags(args, argv)
         sys.argv = argv
         batch_main()

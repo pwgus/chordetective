@@ -141,6 +141,46 @@ def _analyze(audio_path: Path, settings: AnalysisSettings):
     return result, processor.get_duration()
 
 
+def _run_one(filepath: str, settings: AnalysisSettings, opts: dict) -> bool:
+    """Analyze + export one file with a header. Returns True on success."""
+    print('=' * 60)
+    print(f"File: {filepath}")
+    print('=' * 60)
+    try:
+        analyze_and_export(filepath, settings, **opts)
+        return True
+    except Exception as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        return False
+
+
+def _worker(task):
+    """Process-pool worker: run one file, capturing its output as a string.
+
+    Output is buffered (not streamed) so concurrent files don't interleave;
+    the parent prints each block in order. tqdm bars are disabled in workers.
+    """
+    import io
+    import os
+    import contextlib
+
+    os.environ['TQDM_DISABLE'] = '1'
+    filepath, settings, opts = task
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        ok = _run_one(filepath, settings, opts)
+    return filepath, buf.getvalue(), ok
+
+
+def _resolve_jobs(requested, n_files: int) -> int:
+    """Number of worker processes: auto (<=0/None) = min(CPUs, #files)."""
+    import os
+    cpu = os.cpu_count() or 1
+    if requested is None or requested <= 0:
+        return max(1, min(cpu, n_files))
+    return max(1, min(requested, n_files))
+
+
 def main():
     config = Config()
 
@@ -161,6 +201,10 @@ def main():
   # Adaptive windows, aggressive smoothing with HMM
   python cli_advanced.py song.wav --segmentation adaptive \\
       --flux-sensitivity 0.7 --hmm
+
+  # Batch many files across CPU cores (auto-detect, or force with -j)
+  python cli_advanced.py *.wav --video
+  python cli_advanced.py *.wav -j 4
         '''
     )
 
@@ -197,6 +241,9 @@ def main():
                         help='Also draw raw (unsmoothed) detections in the video')
     parser.add_argument('--no-cache', action='store_true',
                         help='Disable caching')
+    parser.add_argument('-j', '--jobs', type=int, default=None,
+                        help='Parallel worker processes (default: auto = '
+                             'min(CPUs, #files); 1 = serial with live output)')
 
     args = parser.parse_args()
 
@@ -223,28 +270,31 @@ def main():
         parser.print_help()
         return
 
-    print(f"Processing {len(all_files)} file(s)...\n")
+    opts = {
+        'output_dir': args.output_dir,
+        'generate_video': args.video,
+        'video_res': video_res,
+        'use_cache': not args.no_cache,
+        'show_raw': args.show_raw,
+    }
+    jobs = _resolve_jobs(args.jobs, len(all_files))
 
-    for filepath in all_files:
-        print(f"{'='*60}")
-        print(f"File: {filepath}")
-        print(f"{'='*60}")
+    if jobs == 1:
+        # Serial: stream output live (keeps tqdm video progress bars).
+        print(f"Processing {len(all_files)} file(s)...\n")
+        for filepath in all_files:
+            _run_one(filepath, settings, opts)
+            print()
+    else:
+        # Parallel: one process per file, output buffered and printed in order.
+        from concurrent.futures import ProcessPoolExecutor
 
-        try:
-            analyze_and_export(
-                filepath,
-                settings,
-                output_dir=args.output_dir,
-                generate_video=args.video,
-                video_res=video_res,
-                use_cache=not args.no_cache,
-                show_raw=args.show_raw
-            )
-        except Exception as e:
-            print(f"✗ Error: {e}", file=sys.stderr)
-            continue
-
-        print()
+        print(f"Processing {len(all_files)} file(s) on {jobs} cores...\n")
+        tasks = [(fp, settings, opts) for fp in all_files]
+        with ProcessPoolExecutor(max_workers=jobs) as executor:
+            for _fp, log, _ok in executor.map(_worker, tasks):
+                print(log, end='')
+                print()
 
     print("✓ All done!")
 

@@ -1,16 +1,19 @@
-# Music Analyzer
+# chordetective
 
-Análisis en tiempo real de audio para extraer notas y acordes con interfaz gráfica y CLI.
+CLI tool to analyze audio and extract notes and chords, with sequence smoothing, export (JSON/CSV), video generation and multicore processing.
 
 ## Features
 
-✓ Carga de archivos de audio (WAV, MP3, FLAC, OGG, M4A)
-✓ Detección de notas en tiempo real usando análisis de pitch
-✓ Detección de acordes desde características de chroma
-✓ GUI interactiva con visualización de espectrograma
-✓ CLI para procesamiento en batch
-✓ Exportación de resultados (JSON, CSV)
-✓ Generación de vídeos con análisis sincronizado
+✓ Audio file loading (WAV, MP3, FLAC, OGG, M4A)
+✓ Note detection via pitch tracking (PYIN) or chroma
+✓ Chord detection from chroma features (CQT or STFT)
+✓ Onset, fixed-window or adaptive segmentation
+✓ Sequence smoothing (median filter, majority vote, HMM/Viterbi)
+✓ Key estimation
+✓ Result export (JSON, notes/chords/combined CSV)
+✓ Video generation with synchronized analysis
+✓ Result caching per file and parameters
+✓ Multicore batch processing
 
 ## Installation
 
@@ -18,7 +21,7 @@ Análisis en tiempo real de audio para extraer notas y acordes con interfaz grá
 pip install -r requirements.txt
 ```
 
-Requiere `ffmpeg` instalado en el sistema para generación de vídeos:
+Requires `ffmpeg` installed on the system for video generation:
 ```bash
 # macOS
 brew install ffmpeg
@@ -32,147 +35,204 @@ sudo pacman -S ffmpeg
 
 ## Usage
 
-### GUI
+The app exposes two subcommands: `analyze` (fast, notes only) and `batch` (full
+pipeline: notes + chords + export + video + cache + multicore).
 
 ```bash
-python main.py gui
-# o simplemente
-python main.py
+python main.py            # show help
+python main.py analyze --help
+python main.py batch --help
 ```
 
-**Flujo:**
-1. Selecciona archivo de audio
-2. Ajusta slider de ventana FFT (512-4096 samples)
-3. Haz clic en "Analyze"
-4. Visualiza notas detectadas sobre el espectrograma
-
-### CLI - Análisis simple
+### `analyze` — Simple analysis (notes only)
 
 ```bash
 python main.py analyze audio.wav
-```
-
-**Opciones:**
-```bash
 python main.py analyze audio.wav \
-  --n-fft 2048 \
   --method pitch \
   --confidence 0.5 \
   --output-json results.json
 ```
 
-- `--n-fft`: Tamaño de ventana FFT (512-4096)
-- `--method`: 'pitch' (pitch tracking) o 'chroma' (pitch class features)
-- `--confidence`: Umbral mínimo de confianza (0-1)
-- `--output-json`: Guardar resultados en JSON
+- `--method`: `pitch` (pitch tracking) or `chroma` (pitch class features)
+- `--confidence`: Minimum confidence threshold (0-1)
+- `--output-json`: Save results to JSON
+- Also accepts the common analysis options (see below).
 
-### CLI - Análisis avanzado
+### `batch` — Full pipeline (notes + chords)
 
-```python
-from audio_processor import AudioProcessor
-from music_analyzer import NoteDetector
-from chord_detector import ChordDetector
-from exporters import AnalysisExporter
+```bash
+# Single file
+python main.py batch song.wav
 
-# Cargar audio
-processor = AudioProcessor()
-processor.load('audio.wav')
+# Multiple files, with 1080p video
+python main.py batch *.wav --video --video-res 1080p
 
-# Detectar notas
-note_detector = NoteDetector(sr=processor.sr)
-notes = note_detector.detect_notes_from_pitch(
-    processor.y, n_fft=2048, confidence_threshold=0.4
-)
-
-# Detectar acordes
-chord_detector = ChordDetector(sr=processor.sr)
-chords = chord_detector.detect_chords(
-    processor.y, n_fft=2048, confidence_threshold=0.3
-)
-
-# Exportar
-AnalysisExporter.export_json(
-    'results.json', 'audio.wav', processor.get_duration(),
-    notes, chords
-)
-AnalysisExporter.export_csv_notes('notes.csv', notes)
-AnalysisExporter.export_csv_chords('chords.csv', chords)
+# Custom output directory
+python main.py batch audio.wav --output-dir ./results
 ```
 
-## Architecture
+**`batch`-specific options:**
+- `--output-dir`: Output folder (default: `<audio_folder>/analysis`)
+- `--note-conf`: Note confidence threshold 0-1 (default: 0.4)
+- `--chord-conf`: Chord confidence threshold 0-1 (default: 0.3)
+- `--video`: Generate MP4 with the visualization
+- `--video-res`: `720p` or `1080p` (default: 720p)
+- `--show-raw`: Also draw the raw (unsmoothed) detections in the video
+- `--no-cache`: Disable caching
+- `-j`, `--jobs`: Parallel processes (see [Multicore processing](#multicore-processing))
+
+### Common analysis options
+
+Available in both `analyze` and `batch`. If not given, the last value saved in
+`.music_analyzer.json` is used.
+
+- `--n-fft`: FFT window size (default: 2048)
+- `--transform`: `cqt` or `stft` (default: cqt)
+- `--segmentation`: `onsets`, `fixed` or `adaptive` (default: onsets)
+- `--window-size`: Window size in samples, `fixed` mode only (default: 2048)
+- `--flux-sensitivity`: Transition sensitivity 0.0-1.0, `adaptive` mode only (default: 0.5)
+- `--min-note-duration`: Discard notes shorter than this many ms (default: 100)
+- `--median-frames`: Median filter in frames, 1 disables it (default: 3)
+- `--majority-frames`: Majority vote window, 0 disables it (default: 0)
+- `--hmm` / `--no-hmm`: HMM (Viterbi) smoothing; slower (default: off)
+
+**Advanced examples:**
+```bash
+# Fixed windows (classic behavior), no smoothing
+python main.py batch song.wav --segmentation fixed --window-size 2048 \
+  --median-frames 1 --min-note-duration 0
+
+# Adaptive windows with HMM smoothing
+python main.py batch song.wav --segmentation adaptive \
+  --flux-sensitivity 0.7 --hmm
+```
+
+## Multicore processing
+
+`batch` processes each file in its own process, spreading the load across the CPU
+cores. Parallelism is at the file level (each analysis is CPU-bound: PYIN,
+CQT/STFT), so it sidesteps Python's GIL.
+
+```bash
+# Auto: uses min(cores, #files)
+python main.py batch *.wav
+
+# Force 4 processes
+python main.py batch *.wav -j 4
+
+# Serial, with live video progress bars
+python main.py batch *.wav -j 1
+```
+
+- `-j`/`--jobs` defaults to automatic: `min(available cores, #files)`.
+- With a single file, or with `-j 1`, it runs serially and the output (including the
+  `tqdm` video bars) is shown live.
+- In parallel, each file's output is buffered and printed in order, without
+  interleaving.
+- `-j` is a runtime option; it is not persisted to the configuration.
+
+## Output
+
+For each input file `<name>`, `batch` generates, in the output directory:
 
 ```
-audio_processor.py      - Cargar y procesar audio
-music_analyzer.py       - Detección de notas (pitch + chroma)
-chord_detector.py       - Detección de acordes desde chroma
-video_generator.py      - Generación de vídeos MP4
-exporters.py            - Exportación JSON/CSV
-gui.py                  - Interfaz gráfica PyQt5
-cli.py                  - Interfaz de línea de comandos
-main.py                 - Punto de entrada
+<name>_analysis.json     - Full analysis (notes + chords + metadata)
+<name>_notes.csv         - Smoothed notes
+<name>_chords.csv        - Smoothed chords
+<name>_combined.csv      - Notes and chords aligned by time
+<name>_analysis.mp4      - Video (only with --video)
 ```
-
-## Parameters Explained
-
-### n_fft (FFT Window Size)
-- **Rango:** 512 - 4096 samples
-- **Efecto:** Ventanas más grandes = mejor resolución de frecuencia pero peor temporal
-- **Default:** 2048
-- **Recomendación:** 
-  - Música de baja frecuencia: 4096
-  - Música de alta frecuencia: 1024
-  - Equilibrio: 2048
-
-### confidence_threshold
-- **Rango:** 0.0 - 1.0
-- **Efecto:** Solo muestra detecciones con confianza superior a este valor
-- **Default:** 0.5 (notas), 0.3 (acordes)
-
-### method (Detección de notas)
-- **pitch**: Usa PYIN para extracción de pitch fundamental
-  - Pros: Información de frecuencia exacta, octava correcta
-  - Contras: Más lento
-- **chroma**: Usa características de pitch class (energía por nota relativa)
-  - Pros: Más rápido, robusto
-  - Contras: Sin información de octava
-
-## Output Formats
 
 ### JSON
 ```json
 {
   "audio_file": "song.wav",
   "duration": 120.5,
+  "metadata": { "settings": { "...": "..." }, "onsets": [0.5, 1.2] },
   "notes": [
-    {"time": 0.5, "name": "C4", "frequency": 261.6, "confidence": 85.3},
-    {"time": 1.2, "name": "D4", "frequency": 293.7, "confidence": 92.1}
+    {"time": 0.5, "duration": 0.3, "name": "C4", "frequency": 261.6, "confidence": 85.3}
   ],
   "chords": [
-    {"time": 0.0, "name": "Cmaj", "confidence": 78.5},
-    {"time": 2.0, "name": "Amin", "confidence": 82.1}
+    {"time": 0.0, "duration": 2.0, "name": "Cmaj", "confidence": 78.5}
   ]
 }
 ```
 
 ### CSV (Notes)
 ```
-Time (s),Note,Frequency (Hz),Confidence (%)
-0.500,C4,261.6,85.3
-1.200,D4,293.7,92.1
+Time (s),Duration (s),Note,Frequency (Hz),Confidence (%)
+0.500,0.300,C4,261.6,85.3
 ```
 
 ### CSV (Chords)
 ```
-Time (s),Chord,Confidence (%)
-0.000,Cmaj,78.5
-2.000,Amin,82.1
+Time (s),Duration (s),Chord,Confidence (%)
+0.000,2.000,Cmaj,78.5
 ```
+
+### CSV (Combined)
+```
+Time (s),Notes,Chords
+0.00,C4 (85%),Cmaj (79%)
+```
+
+## Architecture
+
+```
+audio_processor.py      - Load and process audio
+music_analyzer.py       - Segmentation, note detection and pipeline (run_full_analysis)
+chord_detector.py       - Chord detection and key estimation
+smoother.py             - Sequence smoothing (median, vote, HMM)
+video_generator.py      - MP4 video generation
+exporters.py            - JSON/CSV export
+cache_manager.py        - Analysis cache per file + parameters
+config.py               - Persistent configuration (.music_analyzer.json)
+cli.py                  - Backend for the analyze subcommand
+cli_advanced.py         - Backend for the batch subcommand (incl. multicore)
+main.py                 - Entry point (argparse, subcommands)
+```
+
+## Parameters Explained
+
+### n_fft (FFT Window Size)
+- **Effect:** Larger windows = better frequency resolution but worse temporal
+- **Default:** 2048
+- **Recommendation:**
+  - Low-frequency music: 4096
+  - High-frequency music: 1024
+  - Balanced: 2048
+
+### transform
+- **cqt:** Constant-Q, better for music (logarithmic frequency resolution)
+- **stft:** Short-Time Fourier Transform, linear resolution
+
+### segmentation
+- **onsets:** Segments at detected attacks (default)
+- **fixed:** Fixed-size windows (`--window-size`)
+- **adaptive:** Boundaries from spectral flux (`--flux-sensitivity`)
+
+### confidence_threshold
+- **Range:** 0.0 - 1.0
+- **Effect:** Only shows detections with confidence above this value
+- **Default:** 0.4 (notes), 0.3 (chords)
+
+### method (note detection, `analyze` only)
+- **pitch:** PYIN for fundamental pitch. Exact frequency and octave; slower.
+- **chroma:** Pitch class (relative per-note energy). Faster; no octave.
+
+### Smoothing
+- **min-note-duration:** Removes very short spurious notes
+- **median-frames:** Median filter over the label sequence
+- **majority-frames:** Gaussian-weighted majority vote
+- **hmm:** Viterbi decoding for the most likely sequence (slower)
 
 ## Performance Notes
 
-- **Audio de ~3min a 22050Hz:** ~10-20s (pitch), ~5-10s (chroma)
-- **GUI es responsive:** Análisis en background thread
-- **Generación de vídeo:** ~1-2 min por minuto de audio (4 threads)
+- **~3min audio at 22050Hz:** ~10-20s (pitch), ~5-10s (chroma)
+- **Video generation:** ~1-2 min per minute of audio
+- **Multicore batch:** throughput scales ~linearly with the number of cores up to
+  the number of files
 
 ## Troubleshooting
 
@@ -181,26 +241,28 @@ Time (s),Chord,Confidence (%)
 pip install librosa
 ```
 
-### Error: "FFmpeg not found" (al generar vídeo)
-Instala ffmpeg (ver Installation section)
+### Error: "FFmpeg not found" (when generating video)
+Install ffmpeg (see Installation section)
 
-### Análisis lento
+### Slow analysis
 - Reduce `n_fft` (2048 → 1024)
-- Usa method='chroma' en lugar de 'pitch'
-- Aumenta `confidence_threshold` para filtrar ruido
+- Use `--method chroma` instead of `pitch` (in `analyze`)
+- Raise the confidence thresholds to filter noise
+- In batch, leave parallelism on auto or raise `-j`
 
-### Detecciones incorrectas
-- Intenta diferentes valores de `n_fft`
-- Sube `confidence_threshold` para eliminar falsos positivos
-- Verifica que audio sea monoaural y limpio
+### Wrong detections
+- Try different `n_fft` values
+- Raise the confidence thresholds to remove false positives
+- Tune smoothing (`--median-frames`, `--hmm`)
+- Make sure the audio is mono and clean
 
 ## Development
 
-Estructura modular permite agregar:
-- Nuevas interfaces (Web, CLI mejorada)
-- Nuevos métodos de detección (ML-based)
-- Análisis adicional (tempo, key detection)
-- Formatos de exportación (MIDI, notation)
+Modular structure allows adding:
+- New interfaces (Web, API)
+- New detection methods (ML-based)
+- Additional analysis (tempo, score)
+- Export formats (MIDI, notation)
 
 ## License
 

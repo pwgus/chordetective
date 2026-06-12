@@ -1,4 +1,4 @@
-"""Music Analyzer - Main entry point with GUI and CLI modes."""
+"""Music Analyzer - CLI entry point."""
 
 import sys
 import argparse
@@ -47,35 +47,26 @@ def main():
         prog='music-analyzer',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
-Usage modes:
-  GUI (default):
-    python main.py gui
-    python main.py gui --advanced          # with playback controls
+Examples:
+  # Analyze single file (notes only)
+  python main.py analyze audio.wav
+  python main.py analyze audio.wav --output-json results.json
 
-  CLI - Simple:
-    python main.py analyze audio.wav
-    python main.py analyze audio.wav --output-json results.json
+  # Full pipeline (notes + chords, batch, video, cache)
+  python main.py batch song.wav
+  python main.py batch *.wav --video --video-res 1080p
+  python main.py batch audio.wav --output-dir ./results
 
-  CLI - Advanced (batch, video, cache):
-    python main.py batch *.wav --video --video-res 1080p
-    python main.py batch audio.wav --output-dir ./results
-
-Quick start:
-  python main.py gui                          # Launch GUI
-  python main.py batch song.wav --video       # Analyze + generate video
-  python main.py analyze song.wav --segmentation adaptive --hmm
+  # Advanced options
+  python main.py batch song.wav --segmentation adaptive --hmm
+  python main.py batch song.wav --video --show-raw
         '''
     )
 
     subparsers = parser.add_subparsers(dest='command', help='Command to run')
 
-    # GUI command
-    gui_parser = subparsers.add_parser('gui', help='Launch graphical interface')
-    gui_parser.add_argument('--advanced', action='store_true',
-                           help='Use advanced GUI with playback and timeline')
-
     # Simple analyze command
-    simple_parser = subparsers.add_parser('analyze', help='Analyze single file (simple)')
+    simple_parser = subparsers.add_parser('analyze', help='Analyze single file (notes only)')
     simple_parser.add_argument('file', help='Audio file path')
     simple_parser.add_argument('--method', choices=['pitch', 'chroma'], default=None)
     simple_parser.add_argument('--output-json', help='Save results to JSON')
@@ -97,23 +88,7 @@ Quick start:
 
     args = parser.parse_args()
 
-    if args.command == 'gui' or args.command is None:
-        if hasattr(args, 'advanced') and args.advanced:
-            try:
-                from gui_advanced import main as gui_main
-                gui_main()
-            except ImportError:
-                print("Error: PyQt5 or audio libraries not installed")
-                print("Install: pip install -r requirements.txt")
-        else:
-            try:
-                from gui import main as gui_main
-                gui_main()
-            except ImportError:
-                print("Error: PyQt5 not installed")
-                print("Install: pip install -r requirements.txt")
-
-    elif args.command == 'analyze':
+    if args.command == 'analyze':
         from cli import main as cli_main
         argv = [sys.argv[0], args.file]
         if args.method is not None:

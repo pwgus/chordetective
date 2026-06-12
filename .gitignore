@@ -49,3 +49,7 @@ output/
 # Temp
 .DS_Store
 *.tmp
+
+# Custom
+.claude/
+TODO.md

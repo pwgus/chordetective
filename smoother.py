@@ -7,14 +7,12 @@ their inputs, so raw and smoothed sequences can coexist.
 """
 
 import dataclasses
-import re
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
 import numpy as np
 
-NOTES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-_PITCH_RE = re.compile(r'^([A-G]#?)(-?\d+)$')
+from notes import label_to_ordinal, ordinal_to_freq
 
 
 @dataclass
@@ -36,26 +34,6 @@ def _label_field(det) -> str:
 
 def get_label(det) -> str:
     return getattr(det, _label_field(det))
-
-
-def label_to_ordinal(label: str) -> Optional[int]:
-    """Map a pitched label like 'C#4' to a semitone index.
-
-    Uses the project convention from NoteDetector (440 Hz <-> index 57).
-    Returns None for unpitched labels (chords, 'silence', octave-less notes).
-    """
-    m = _PITCH_RE.match(label or '')
-    if not m:
-        return None
-    return NOTES.index(m.group(1)) + (int(m.group(2)) + 1) * 12
-
-
-def ordinal_to_label(ordinal: int) -> str:
-    return f"{NOTES[ordinal % 12]}{ordinal // 12 - 1}"
-
-
-def ordinal_to_freq(ordinal: int) -> float:
-    return float(440.0 * 2 ** ((ordinal - 57) / 12))
 
 
 def with_label(det, label: str):

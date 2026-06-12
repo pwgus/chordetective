@@ -2,8 +2,10 @@
 
 import json
 import csv
+from collections import defaultdict
 from pathlib import Path
 from typing import List, Optional
+
 from music_analyzer import Detection
 from chord_detector import ChordDetection
 
@@ -23,7 +25,7 @@ class AnalysisExporter:
             'notes': [
                 {
                     'time': n.time,
-                    'duration': getattr(n, 'duration', 0.0),
+                    'duration': n.duration,
                     'name': n.note_name,
                     'frequency': n.frequency,
                     'confidence': n.confidence
@@ -36,7 +38,7 @@ class AnalysisExporter:
             data['chords'] = [
                 {
                     'time': c.time,
-                    'duration': getattr(c, 'duration', 0.0),
+                    'duration': c.duration,
                     'name': c.chord_name,
                     'confidence': c.confidence
                 }
@@ -55,7 +57,7 @@ class AnalysisExporter:
             for note in notes:
                 writer.writerow([
                     f'{note.time:.3f}',
-                    f'{getattr(note, "duration", 0.0):.3f}',
+                    f'{note.duration:.3f}',
                     note.note_name,
                     f'{note.frequency:.1f}',
                     f'{note.confidence:.1f}'
@@ -70,7 +72,7 @@ class AnalysisExporter:
             for chord in chords:
                 writer.writerow([
                     f'{chord.time:.3f}',
-                    f'{getattr(chord, "duration", 0.0):.3f}',
+                    f'{chord.duration:.3f}',
                     chord.chord_name,
                     f'{chord.confidence:.1f}'
                 ])
@@ -80,20 +82,13 @@ class AnalysisExporter:
                            chords: Optional[List[ChordDetection]] = None):
         """Export notes and chords to single CSV (aligned by time)."""
         # Create time-indexed maps
-        note_map = {}
+        note_map = defaultdict(list)
         for note in notes:
-            t = round(note.time, 2)
-            if t not in note_map:
-                note_map[t] = []
-            note_map[t].append(note)
+            note_map[round(note.time, 2)].append(note)
 
-        chord_map = {}
-        if chords:
-            for chord in chords:
-                t = round(chord.time, 2)
-                if t not in chord_map:
-                    chord_map[t] = []
-                chord_map[t].append(chord)
+        chord_map = defaultdict(list)
+        for chord in chords or []:
+            chord_map[round(chord.time, 2)].append(chord)
 
         # Merge keys
         all_times = sorted(set(note_map.keys()) | set(chord_map.keys()))

@@ -180,17 +180,17 @@ Time (s),Notes,Chords
 ## Architecture
 
 ```
-audio_processor.py      - Load and process audio
-music_analyzer.py       - Segmentation, note detection and pipeline (run_full_analysis)
+audio_processor.py      - Audio loading, segmentation and shared signal helpers
+notes.py                - Note names and pitch conversions (MIDI convention)
+music_analyzer.py       - Note detection and pipeline (run_full_analysis)
 chord_detector.py       - Chord detection and key estimation
 smoother.py             - Sequence smoothing (median, vote, HMM)
 video_generator.py      - MP4 video generation
 exporters.py            - JSON/CSV export
 cache_manager.py        - Analysis cache per file + parameters
 config.py               - Persistent configuration (.music_analyzer.json)
-cli.py                  - Backend for the analyze subcommand
-cli_advanced.py         - Backend for the batch subcommand (incl. multicore)
-main.py                 - Entry point (argparse, subcommands)
+cli.py                  - Subcommand implementations (analyze + batch/multicore)
+main.py                 - Entry point (argparse, dispatch)
 ```
 
 ## Parameters Explained

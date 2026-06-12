@@ -1,16 +1,20 @@
-"""Musical note and chord detection."""
+"""Note detection and the full segmentation + detection + smoothing pipeline."""
 
 import numpy as np
 import librosa
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
 from dataclasses import dataclass, field, asdict
 
+from audio_processor import (SILENCE_RMS_RATIO, compute_chroma,
+                             segment_frames, segment_rms)
+from chord_detector import ChordDetector
+from notes import NOTES, freq_to_label
 from smoother import Smoother, SmoothingSettings
 
 
 @dataclass
 class Detection:
-    """Single note/chord detection result."""
+    """Single note detection result."""
     time: float
     note_name: str
     frequency: float
@@ -18,68 +22,27 @@ class Detection:
     duration: float = 0.0  # seconds; 0 for legacy frame-wise detections
 
 
-class NoteDetector:
-    """Detect dominant notes in audio using chroma features and pitch."""
+def _silence(t0: float, t1: float, quiet: bool, conf: float) -> Detection:
+    """Silence detection; confidence reflects certainty that this IS silence."""
+    sil_conf = 90.0 if quiet else float(np.clip(1.0 - conf, 0.0, 1.0)) * 100
+    return Detection(time=float(t0), note_name='silence', frequency=0.0,
+                     confidence=sil_conf, duration=float(t1 - t0))
 
-    # Equal temperament note mapping
-    NOTES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+
+class NoteDetector:
+    """Detect dominant notes in audio via pitch tracking or chroma."""
 
     def __init__(self, sr: int = 22050):
         self.sr = sr
 
-    @staticmethod
-    def freq_to_note(freq: float) -> Tuple[str, int]:
-        """Convert frequency (Hz) to note name and octave."""
-        if freq <= 0:
-            return "silence", -1
-
-        # A4 = 440 Hz, index 57 in semitones
-        semitones_from_a4 = 12 * np.log2(freq / 440)
-        semitone = int(np.round(semitones_from_a4)) + 57
-
-        octave = semitone // 12 - 1
-        note_idx = semitone % 12
-        note_name = NoteDetector.NOTES[note_idx]
-
-        return note_name, octave
-
-    @staticmethod
-    def note_to_freq(note_name: str, octave: int) -> float:
-        """Convert note name + octave to frequency (Hz)."""
-        if note_name == "silence":
-            return 0
-        semitone = NoteDetector.NOTES.index(note_name) + (octave + 1) * 12 - 57
-        return 440 * (2 ** (semitone / 12))
-
-    def detect_chroma(self, y: np.ndarray, n_fft: int = 2048, hop_length: Optional[int] = None,
-                      transform: str = 'cqt') -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Extract chroma features (pitch class distribution).
-
-        Args:
-            transform: 'cqt' (default, variable-resolution) or 'stft'
-
-        Returns:
-            (chroma, times) where chroma is [12 × time]
-        """
-        if hop_length is None:
-            hop_length = n_fft // 4
-
-        if transform == 'stft':
-            chroma = librosa.feature.chroma_stft(y=y, sr=self.sr, n_fft=n_fft,
-                                                 hop_length=hop_length)
-        else:
-            chroma = librosa.feature.chroma_cqt(y=y, sr=self.sr, hop_length=hop_length)
-        times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=self.sr, hop_length=hop_length)
-
-        return chroma, times
-
-    def detect_pitch(self, y: np.ndarray, n_fft: int = 2048, hop_length: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
+    def detect_pitch(self, y: np.ndarray, n_fft: int = 2048,
+                     hop_length: Optional[int] = None
+                     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Detect fundamental frequency using PYIN.
 
         Returns:
-            (f0, times) where f0 is Hz per frame, times in seconds
+            (f0, voiced_probs, times) — f0 in Hz per frame, times in seconds
         """
         if hop_length is None:
             hop_length = n_fft // 4
@@ -88,64 +51,9 @@ class NoteDetector:
             y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'),
             sr=self.sr, hop_length=hop_length
         )
-
-        times = librosa.frames_to_time(np.arange(len(f0)), sr=self.sr, hop_length=hop_length)
-
+        times = librosa.frames_to_time(np.arange(len(f0)), sr=self.sr,
+                                       hop_length=hop_length)
         return f0, voiced_probs, times
-
-    def detect_notes_from_pitch(self, y: np.ndarray, n_fft: int = 2048, hop_length: Optional[int] = None,
-                                 confidence_threshold: float = 0.5) -> List[Detection]:
-        """
-        Detect notes from pitch tracking.
-
-        Args:
-            confidence_threshold: Only return detections with confidence >= this (0-1)
-
-        Returns:
-            List of Detection objects
-        """
-        f0, voiced_probs, times = self.detect_pitch(y, n_fft, hop_length)
-
-        detections = []
-        for i, (freq, conf) in enumerate(zip(f0, voiced_probs)):
-            if conf >= confidence_threshold and not np.isnan(freq):
-                note_name, octave = self.freq_to_note(freq)
-                detections.append(Detection(
-                    time=float(times[i]),
-                    note_name=f"{note_name}{octave}",
-                    frequency=float(freq),
-                    confidence=float(conf * 100)
-                ))
-
-        return detections
-
-    def detect_notes_from_chroma(self, y: np.ndarray, n_fft: int = 2048, hop_length: Optional[int] = None,
-                                  confidence_threshold: float = 0.3,
-                                  transform: str = 'cqt') -> List[Detection]:
-        """
-        Detect notes from chroma features (pitch class energy).
-
-        Returns:
-            List of Detection objects (simplified, no octave info)
-        """
-        chroma, times = self.detect_chroma(y, n_fft, hop_length, transform=transform)
-
-        detections = []
-        for i in range(chroma.shape[1]):
-            energy = chroma[:, i]
-            max_idx = np.argmax(energy)
-            confidence = energy[max_idx] / (np.sum(energy) + 1e-8)
-
-            if confidence >= confidence_threshold:
-                note_name = self.NOTES[max_idx]
-                detections.append(Detection(
-                    time=float(times[i]),
-                    note_name=note_name,
-                    frequency=0.0,  # Chroma doesn't provide frequency
-                    confidence=float(confidence * 100)
-                ))
-
-        return detections
 
     def detect_notes_segmented(self, y: np.ndarray, segments: List[Tuple[float, float]],
                                method: str = 'pitch', transform: str = 'cqt',
@@ -169,79 +77,47 @@ class NoteDetector:
         if hop_length is None:
             hop_length = n_fft // 4
 
-        seg_rms = [_segment_rms(y, t0, t1, self.sr) for t0, t1 in segments]
+        seg_rms = [segment_rms(y, t0, t1, self.sr) for t0, t1 in segments]
         peak_rms = max(seg_rms) if seg_rms else 0.0
 
         detections = []
         if method == 'pitch':
             f0, voiced_probs, times = self.detect_pitch(y, n_fft, hop_length)
             for (t0, t1), rms in zip(segments, seg_rms):
-                i0, i1 = _segment_frames(times, t0, t1)
+                quiet = peak_rms <= 0 or rms < SILENCE_RMS_RATIO * peak_rms
+                i0, i1 = segment_frames(times, t0, t1)
                 seg_f0 = f0[i0:i1]
                 seg_prob = voiced_probs[i0:i1]
                 voiced = (~np.isnan(seg_f0)) & (seg_prob >= 0.3)
                 conf = float(np.mean(seg_prob[voiced])) if voiced.any() else 0.0
 
-                if (peak_rms <= 0 or rms < SILENCE_RMS_RATIO * peak_rms
-                        or voiced.mean() < 0.3 or conf < confidence_threshold):
-                    # Confidence reflects certainty that this IS silence
-                    quiet = peak_rms <= 0 or rms < SILENCE_RMS_RATIO * peak_rms
-                    sil_conf = 90.0 if quiet else float(np.clip(1.0 - conf, 0.0, 1.0)) * 100
-                    detections.append(Detection(
-                        time=float(t0), note_name='silence', frequency=0.0,
-                        confidence=sil_conf, duration=float(t1 - t0)))
+                if quiet or voiced.mean() < 0.3 or conf < confidence_threshold:
+                    detections.append(_silence(t0, t1, quiet, conf))
                 else:
                     freq = float(np.median(seg_f0[voiced]))
-                    name, octave = self.freq_to_note(freq)
                     detections.append(Detection(
-                        time=float(t0), note_name=f"{name}{octave}",
+                        time=float(t0), note_name=freq_to_label(freq),
                         frequency=freq, confidence=conf * 100,
                         duration=float(t1 - t0)))
         else:
-            chroma, times = self.detect_chroma(y, n_fft, hop_length, transform=transform)
+            chroma, times = compute_chroma(y, self.sr, n_fft, hop_length,
+                                           transform=transform)
             for (t0, t1), rms in zip(segments, seg_rms):
-                i0, i1 = _segment_frames(times, t0, t1)
+                quiet = peak_rms <= 0 or rms < SILENCE_RMS_RATIO * peak_rms
+                i0, i1 = segment_frames(times, t0, t1)
                 energy = chroma[:, i0:i1].mean(axis=1)
                 max_idx = int(np.argmax(energy))
                 conf = float(energy[max_idx] / (np.sum(energy) + 1e-8))
 
-                if (peak_rms <= 0 or rms < SILENCE_RMS_RATIO * peak_rms
-                        or conf < confidence_threshold):
-                    quiet = peak_rms <= 0 or rms < SILENCE_RMS_RATIO * peak_rms
-                    sil_conf = 90.0 if quiet else float(np.clip(1.0 - conf, 0.0, 1.0)) * 100
-                    detections.append(Detection(
-                        time=float(t0), note_name='silence', frequency=0.0,
-                        confidence=sil_conf, duration=float(t1 - t0)))
+                if quiet or conf < confidence_threshold:
+                    detections.append(_silence(t0, t1, quiet, conf))
                 else:
                     detections.append(Detection(
-                        time=float(t0), note_name=self.NOTES[max_idx],
+                        time=float(t0), note_name=NOTES[max_idx],
                         frequency=0.0, confidence=conf * 100,
                         duration=float(t1 - t0)))
 
         return detections
-
-
-# Segments quieter than this fraction of the loudest segment count as silence
-SILENCE_RMS_RATIO = 0.02
-
-
-def _segment_rms(y: np.ndarray, t0: float, t1: float, sr: int) -> float:
-    """RMS energy of the audio between t0 and t1 (seconds)."""
-    s0, s1 = int(t0 * sr), max(int(t1 * sr), int(t0 * sr) + 1)
-    chunk = y[s0:s1]
-    if chunk.size == 0:
-        return 0.0
-    return float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
-
-
-def _segment_frames(times: np.ndarray, t0: float, t1: float) -> Tuple[int, int]:
-    """Frame index range [i0, i1) covering segment [t0, t1); never empty."""
-    i0 = int(np.searchsorted(times, t0, side='left'))
-    i1 = int(np.searchsorted(times, t1, side='left'))
-    i0 = min(i0, len(times) - 1)
-    i1 = min(max(i1, i0 + 1), len(times))
-    i0 = min(i0, i1 - 1)
-    return i0, i1
 
 
 @dataclass
@@ -288,8 +164,8 @@ class AnalysisSettings:
     def cache_token(self) -> str:
         """Compact string identifying analysis-relevant parameters (cache key)."""
         s = self.smoothing
-        return (f"v2_{self.transform}_{self.segmentation}_w{self.window_size}"
-                f"_f{self.flux_sensitivity:.2f}_{self.note_method}"
+        return (f"v3_{self.transform}_{self.segmentation}_w{self.window_size}"
+                f"_f{self.flux_sensitivity:.2f}_n{self.n_fft}_{self.note_method}"
                 f"_nc{self.note_confidence:.2f}_cc{self.chord_confidence:.2f}"
                 f"_md{s.median_frames}_dur{s.min_note_duration_ms}"
                 f"_mj{s.majority_frames}_hmm{int(s.hmm)}")
@@ -314,8 +190,6 @@ def run_full_analysis(processor, settings: AnalysisSettings) -> AnalysisResult:
         processor: a loaded AudioProcessor
         settings: AnalysisSettings (see AnalysisSettings.from_config)
     """
-    from chord_detector import ChordDetector
-
     y, sr = processor.y, processor.sr
     if y is None:
         raise RuntimeError("No audio loaded. Call processor.load() first.")

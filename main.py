@@ -1,131 +1,106 @@
 """Music Analyzer - CLI entry point."""
 
-import sys
 import argparse
 
-
-def _add_analysis_flags(parser):
-    """Shared segmentation/smoothing flags (None = use saved config)."""
-    parser.add_argument('--n-fft', type=int, default=None, help='FFT window size')
-    parser.add_argument('--segmentation', choices=['onsets', 'fixed', 'adaptive'],
-                        default=None, help='Segmentation mode (default: onsets)')
-    parser.add_argument('--window-size', type=int, default=None,
-                        help='Window size in samples (fixed mode only)')
-    parser.add_argument('--flux-sensitivity', type=float, default=None,
-                        help='Transition sensitivity 0.0-1.0 (adaptive mode only)')
-    parser.add_argument('--min-note-duration', type=int, default=None,
-                        help='Discard notes shorter than this many ms (default: 100)')
-    parser.add_argument('--median-frames', type=int, default=None,
-                        help='Median filter frames, 1 disables (default: 3)')
-    parser.add_argument('--majority-frames', type=int, default=None,
-                        help='Majority vote window, 0 disables (default: 0)')
-    parser.add_argument('--hmm', action=argparse.BooleanOptionalAction, default=None,
-                        help='HMM (Viterbi) smoothing; slower')
-    parser.add_argument('--transform', choices=['cqt', 'stft'], default=None,
-                        help='Analysis transform (default: cqt)')
-
-
-def _forward_analysis_flags(args, argv):
-    """Append shared flags to a rebuilt argv when explicitly given."""
-    for flag, attr in [('--n-fft', 'n_fft'), ('--segmentation', 'segmentation'),
-                       ('--window-size', 'window_size'),
-                       ('--flux-sensitivity', 'flux_sensitivity'),
-                       ('--min-note-duration', 'min_note_duration'),
-                       ('--median-frames', 'median_frames'),
-                       ('--majority-frames', 'majority_frames'),
-                       ('--transform', 'transform')]:
-        value = getattr(args, attr)
-        if value is not None:
-            argv.extend([flag, str(value)])
-    if args.hmm is not None:
-        argv.append('--hmm' if args.hmm else '--no-hmm')
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description='Music Analyzer - Audio analysis for notes and chords',
-        prog='music-analyzer',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''
+EPILOG = """
 Examples:
-  # Analyze single file (notes only)
+  # Analyze a single file (notes only)
   python main.py analyze audio.wav
   python main.py analyze audio.wav --output-json results.json
 
-  # Full pipeline (notes + chords, batch, video, cache)
+  # Full pipeline (notes + chords, export, video, cache)
   python main.py batch song.wav
   python main.py batch *.wav --video --video-res 1080p
   python main.py batch audio.wav --output-dir ./results
 
-  # Advanced options
+  # Parallel batch across CPU cores (auto-detect, or force with -j)
+  python main.py batch *.wav -j 4
+
+  # Advanced analysis options
   python main.py batch song.wav --segmentation adaptive --hmm
   python main.py batch song.wav --video --show-raw
-        '''
-    )
+"""
+
+
+def _common_options() -> argparse.ArgumentParser:
+    """Analysis flags shared by both subcommands (None = use saved config)."""
+    common = argparse.ArgumentParser(add_help=False)
+    group = common.add_argument_group('analysis options')
+    group.add_argument('--n-fft', type=int, default=None,
+                       help='FFT window size (default: 2048)')
+    group.add_argument('--transform', choices=['cqt', 'stft'], default=None,
+                       help='Analysis transform (default: cqt)')
+    group.add_argument('--segmentation', choices=['onsets', 'fixed', 'adaptive'],
+                       default=None, help='Segmentation mode (default: onsets)')
+    group.add_argument('--window-size', type=int, default=None,
+                       help='Window size in samples, fixed mode only (default: 2048)')
+    group.add_argument('--flux-sensitivity', type=float, default=None,
+                       help='Transition sensitivity 0.0-1.0, adaptive mode only '
+                            '(default: 0.5)')
+    group.add_argument('--min-note-duration', type=int, default=None,
+                       help='Discard notes shorter than this many ms (default: 100)')
+    group.add_argument('--median-frames', type=int, default=None,
+                       help='Median filter size in frames, 1 disables (default: 3)')
+    group.add_argument('--majority-frames', type=int, default=None,
+                       help='Gaussian-weighted majority vote window, 0 disables '
+                            '(default: 0)')
+    group.add_argument('--hmm', action=argparse.BooleanOptionalAction, default=None,
+                       help='HMM (Viterbi) smoothing; slower (default: off)')
+    return common
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog='music-analyzer',
+        description='Music Analyzer - Audio analysis for notes and chords',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=EPILOG)
 
     subparsers = parser.add_subparsers(dest='command', help='Command to run')
+    common = _common_options()
 
-    # Simple analyze command
-    simple_parser = subparsers.add_parser('analyze', help='Analyze single file (notes only)')
-    simple_parser.add_argument('file', help='Audio file path')
-    simple_parser.add_argument('--method', choices=['pitch', 'chroma'], default=None)
-    simple_parser.add_argument('--output-json', help='Save results to JSON')
-    simple_parser.add_argument('--confidence', type=float, default=None)
-    _add_analysis_flags(simple_parser)
+    analyze = subparsers.add_parser(
+        'analyze', parents=[common], help='Analyze a single file (notes only)')
+    analyze.add_argument('file', help='Audio file path')
+    analyze.add_argument('--method', choices=['pitch', 'chroma'], default=None,
+                         help='Note detection method (default: pitch)')
+    analyze.add_argument('--confidence', type=float, default=None,
+                         help='Note confidence threshold 0-1 (default: 0.4)')
+    analyze.add_argument('--output-json', help='Save results to JSON')
 
-    # Advanced batch command
-    batch_parser = subparsers.add_parser('batch', help='Analyze files with all features')
-    batch_parser.add_argument('files', nargs='+', help='Audio file(s) to analyze')
-    batch_parser.add_argument('--output-dir', help='Output directory')
-    batch_parser.add_argument('--note-conf', type=float, default=None)
-    batch_parser.add_argument('--chord-conf', type=float, default=None)
-    batch_parser.add_argument('--video', action='store_true', help='Generate MP4')
-    batch_parser.add_argument('--video-res', choices=['720p', '1080p'], default=None)
-    batch_parser.add_argument('--show-raw', action='store_true',
-                              help='Draw raw detections in the video too')
-    batch_parser.add_argument('--no-cache', action='store_true')
-    batch_parser.add_argument('-j', '--jobs', type=int, default=None,
-                              help='Parallel worker processes (default: auto)')
-    _add_analysis_flags(batch_parser)
+    batch = subparsers.add_parser(
+        'batch', parents=[common],
+        help='Full pipeline: notes + chords, export, video, cache')
+    batch.add_argument('files', nargs='+', help='Audio file(s) to analyze')
+    batch.add_argument('--output-dir',
+                       help='Output directory (default: <input dir>/analysis)')
+    batch.add_argument('--note-conf', type=float, default=None,
+                       help='Note confidence threshold 0-1 (default: 0.4)')
+    batch.add_argument('--chord-conf', type=float, default=None,
+                       help='Chord confidence threshold 0-1 (default: 0.3)')
+    batch.add_argument('--video', action='store_true',
+                       help='Generate MP4 video with visualization')
+    batch.add_argument('--video-res', choices=['720p', '1080p'], default=None,
+                       help='Video resolution (default: 720p)')
+    batch.add_argument('--show-raw', action='store_true',
+                       help='Also draw raw (unsmoothed) detections in the video')
+    batch.add_argument('--no-cache', action='store_true', help='Disable caching')
+    batch.add_argument('-j', '--jobs', type=int, default=None,
+                       help='Parallel worker processes (default: auto = '
+                            'min(CPUs, #files); 1 = serial with live output)')
+    return parser
 
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.command == 'analyze':
-        from cli import main as cli_main
-        argv = [sys.argv[0], args.file]
-        if args.method is not None:
-            argv.extend(['--method', args.method])
-        if args.output_json:
-            argv.extend(['--output-json', args.output_json])
-        if args.confidence is not None:
-            argv.extend(['--confidence', str(args.confidence)])
-        _forward_analysis_flags(args, argv)
-        sys.argv = argv
-        cli_main()
-
+        from cli import run_analyze
+        run_analyze(args)
     elif args.command == 'batch':
-        from cli_advanced import main as batch_main
-        argv = [sys.argv[0]] + args.files
-        if args.output_dir:
-            argv.extend(['--output-dir', args.output_dir])
-        if args.note_conf is not None:
-            argv.extend(['--note-conf', str(args.note_conf)])
-        if args.chord_conf is not None:
-            argv.extend(['--chord-conf', str(args.chord_conf)])
-        if args.video:
-            argv.append('--video')
-        if args.video_res is not None:
-            argv.extend(['--video-res', args.video_res])
-        if args.show_raw:
-            argv.append('--show-raw')
-        if args.no_cache:
-            argv.append('--no-cache')
-        if args.jobs is not None:
-            argv.extend(['--jobs', str(args.jobs)])
-        _forward_analysis_flags(args, argv)
-        sys.argv = argv
-        batch_main()
-
+        from cli import run_batch
+        run_batch(args)
     else:
         parser.print_help()
 

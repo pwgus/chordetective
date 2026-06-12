@@ -2,12 +2,13 @@
 
 import numpy as np
 import librosa
-from pathlib import Path
 from typing import List, Optional
 import tempfile
 import os
 import subprocess
 from tqdm import tqdm
+
+from audio_processor import AudioProcessor
 from music_analyzer import Detection
 from chord_detector import ChordDetection
 
@@ -59,11 +60,12 @@ class VideoGenerator:
             transform: 'cqt' or 'stft' background spectrogram
         """
         print(f"Loading audio: {audio_path}")
-        y, sr = librosa.load(audio_path, sr=self.sr)
-        duration = librosa.get_duration(y=y, sr=sr)
+        processor = AudioProcessor(sr=self.sr)
+        processor.load(audio_path)
+        duration = processor.get_duration()
 
         print(f"Computing spectrogram ({transform})...")
-        S, freqs, times = self._compute_spectrogram(y, n_fft, transform)
+        S, freqs, times = processor.compute_transform(transform=transform, n_fft=n_fft)
         S_db = librosa.power_to_db(S**2, ref=np.max)
 
         # Set resolution
@@ -91,27 +93,6 @@ class VideoGenerator:
             self._combine_frames_with_audio(tmpdir, audio_path, output_video, width, height)
 
         print(f"✓ Video saved: {output_video}")
-
-    def _compute_spectrogram(self, y: np.ndarray, n_fft: int, transform: str = 'cqt'):
-        """Compute spectrogram via STFT or CQT."""
-        hop_length = n_fft // 4
-        if transform == 'stft':
-            D = librosa.stft(y, n_fft=n_fft, hop_length=hop_length)
-            S = np.abs(D)
-            freqs = librosa.fft_frequencies(sr=self.sr, n_fft=n_fft)
-        else:
-            n_bins, bins_per_octave = 84, 12
-            fmin = librosa.note_to_hz('C1')
-            # librosa.cqt requires hop_length divisible by 2**(n_octaves - 1)
-            required = 2 ** (int(np.ceil(n_bins / bins_per_octave)) - 1)
-            hop_length = max(required, (hop_length // required) * required)
-            S = np.abs(librosa.cqt(y, sr=self.sr, hop_length=hop_length,
-                                   fmin=fmin, n_bins=n_bins,
-                                   bins_per_octave=bins_per_octave))
-            freqs = librosa.cqt_frequencies(n_bins=n_bins, fmin=fmin,
-                                            bins_per_octave=bins_per_octave)
-        times = librosa.frames_to_time(np.arange(S.shape[1]), sr=self.sr, hop_length=hop_length)
-        return S, freqs, times
 
     def _render_frame_to_file(self, S_db: np.ndarray, freqs: np.ndarray, times: np.ndarray,
                               width: int, height: int, current_time: float,
@@ -198,7 +179,7 @@ class VideoGenerator:
 
         ax.set_xlabel('Time (s)', fontsize=12)
         ax.set_ylabel('Frequency (Hz)', fontsize=12)
-        ax.set_title(f'Music Analysis Visualization', fontsize=14, weight='bold')
+        ax.set_title('Music Analysis Visualization', fontsize=14, weight='bold')
 
         fig.savefig(output_path, dpi=dpi, bbox_inches='tight', pad_inches=0)
         plt.close(fig)

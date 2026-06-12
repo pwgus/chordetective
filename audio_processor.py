@@ -1,10 +1,12 @@
-"""Audio loading and preprocessing module."""
+"""Audio loading, segmentation and shared signal helpers."""
 
 import numpy as np
 import librosa
-import librosa.display
 from pathlib import Path
 from typing import List, Tuple, Optional
+
+# Segments quieter than this fraction of the loudest segment count as silence
+SILENCE_RMS_RATIO = 0.02
 
 
 class AudioProcessor:
@@ -205,15 +207,41 @@ class AudioProcessor:
             segments[-1] = (segments[-1][0], dur)
         return segments
 
-    def get_audio_chunk(self, start_time: float, duration: float) -> np.ndarray:
-        """Extract audio chunk from [start_time, start_time + duration] in seconds."""
-        if self.y is None:
-            raise RuntimeError("No audio loaded.")
-
-        start_sample = int(start_time * self.sr)
-        end_sample = int((start_time + duration) * self.sr)
-        return self.y[start_sample:end_sample]
-
     def get_duration(self) -> Optional[float]:
         """Return total duration in seconds."""
         return self.duration
+
+
+def compute_chroma(y: np.ndarray, sr: int, n_fft: int = 2048,
+                   hop_length: Optional[int] = None,
+                   transform: str = 'cqt') -> Tuple[np.ndarray, np.ndarray]:
+    """Chroma features [12 × frames] plus frame times, via CQT or STFT."""
+    if hop_length is None:
+        hop_length = n_fft // 4
+    if transform == 'stft':
+        chroma = librosa.feature.chroma_stft(y=y, sr=sr, n_fft=n_fft,
+                                             hop_length=hop_length)
+    else:
+        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
+    times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=sr,
+                                   hop_length=hop_length)
+    return chroma, times
+
+
+def segment_rms(y: np.ndarray, t0: float, t1: float, sr: int) -> float:
+    """RMS energy of the audio between t0 and t1 (seconds)."""
+    s0, s1 = int(t0 * sr), max(int(t1 * sr), int(t0 * sr) + 1)
+    chunk = y[s0:s1]
+    if chunk.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
+
+
+def segment_frames(times: np.ndarray, t0: float, t1: float) -> Tuple[int, int]:
+    """Frame index range [i0, i1) covering segment [t0, t1); never empty."""
+    i0 = int(np.searchsorted(times, t0, side='left'))
+    i1 = int(np.searchsorted(times, t1, side='left'))
+    i0 = min(i0, len(times) - 1)
+    i1 = min(max(i1, i0 + 1), len(times))
+    i0 = min(i0, i1 - 1)
+    return i0, i1
